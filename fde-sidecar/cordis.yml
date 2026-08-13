@@ -1,0 +1,48 @@
+# FDE aggregate-only review sidecar. This composition deliberately has no
+# filesystem, shell, subprocess, terminal, MCP, subagent, workflow, job tool,
+# web, telemetry, or live network model provider.
+
+- id: sdk-jsonrpc-server
+  name: '../packages/sdk/server/lib/index.js'
+  config:
+    maxTokensAsSuccess: false
+
+- id: agent-spine
+  name: '../packages/examples/agent-spine-demo/lib/index.js'
+  config:
+    includeHarnessIdentity: false
+    includeRuntimeContext: false
+    persona: |-
+      你是 FDE 汇总审核助手。输入只允许是已经去标识化的 aggregate-only 审核单。
+      只根据汇总指标给出审核建议，不补造客户、人员、物料、订单、金额或原始明细。
+      输出必须符合 fde.agent-suggestion.v1；你没有任何工具，也没有业务写入权。
+    workspaceContext: false
+    dshHome: !!js process.env.FDE_SIDECAR_SESSION_ROOT
+    maxParallelToolCalls: 1
+    skills:
+      enabled: false
+    toolBash: false
+    toolJobs: false
+    goals: false
+
+- id: sessions
+  name: '../packages/session/session-persistence-jsonl/lib/index.js'
+  config:
+    root: !!js process.env.FDE_SIDECAR_SESSION_ROOT
+    compression: none
+    packChunks: false
+    writeBatchMaxDelayMs: 1
+
+- id: llm-replay
+  name: '../packages/test-support/llm-replay/lib/index.js'
+  config:
+    file: !!js process.env.FDE_SIDECAR_REPLAY_FILE
+    overrideFile: !!js process.env.FDE_SIDECAR_REPLAY_OVERRIDE
+    providers:
+      - id: fde-replay
+        name: FDE keyless replay
+        models:
+          - id: aggregate-review-v1
+            contextWindow: 8192
+            inputModalities:
+              - text

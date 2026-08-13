@@ -1,0 +1,22 @@
+[
+  {
+    "kind": "chunks",
+    "chunks": [
+      { "type": "block-start", "index": 0, "blockType": "text" },
+      { "type": "text-delta", "index": 0, "text": "{\"schema\":\"fde.agent-suggestion.v1\",\"verdict\":\"manual-review\",\"summary\":\"虚构样例中的质量检查仍有一项未通过，应先核对演示缺口再继续。\",\"actions\":[{\"code\":\"REVIEW_DEMO_CHECKS\",\"priority\":\"P1\",\"text\":\"核对虚构样例中未通过的一项检查，不补充任何真实业务明细。\"},{\"code\":\"KEEP_HUMAN_GATE\",\"priority\":\"P1\",\"text\":\"Agent 建议只进入草稿区，save、compiler 与 assemble 继续由现有质量门决定。\"}]}" },
+      { "type": "block-end", "index": 0, "block": { "type": "text", "text": "{\"schema\":\"fde.agent-suggestion.v1\",\"verdict\":\"manual-review\",\"summary\":\"虚构样例中的质量检查仍有一项未通过，应先核对演示缺口再继续。\",\"actions\":[{\"code\":\"REVIEW_DEMO_CHECKS\",\"priority\":\"P1\",\"text\":\"核对虚构样例中未通过的一项检查，不补充任何真实业务明细。\"},{\"code\":\"KEEP_HUMAN_GATE\",\"priority\":\"P1\",\"text\":\"Agent 建议只进入草稿区，save、compiler 与 assemble 继续由现有质量门决定。\"}]}" } },
+      { "type": "usage", "usage": { "inputTokens": 128, "outputTokens": 96, "cacheReadTokens": 0 } },
+      { "type": "finish", "reason": { "kind": "stop" } }
+    ]
+  },
+  {
+    "kind": "chunks",
+    "chunks": [
+      { "type": "block-start", "index": 0, "blockType": "text" },
+      { "type": "text-delta", "index": 0, "text": "{\"schema\":\"fde.agent-suggestion.v1\",\"verdict\":\"manual-review\",\"summary\":\"第二张虚构汇总单已独立完成；仍有两个演示元数据缺口，保持草稿态。\",\"actions\":[{\"code\":\"RESOLVE_DEMO_GAPS\",\"priority\":\"P1\",\"text\":\"只核对虚构缺口数量，不向 Agent 补充真实客户或订单明细。\"}]}" },
+      { "type": "block-end", "index": 0, "block": { "type": "text", "text": "{\"schema\":\"fde.agent-suggestion.v1\",\"verdict\":\"manual-review\",\"summary\":\"第二张虚构汇总单已独立完成；仍有两个演示元数据缺口，保持草稿态。\",\"actions\":[{\"code\":\"RESOLVE_DEMO_GAPS\",\"priority\":\"P1\",\"text\":\"只核对虚构缺口数量，不向 Agent 补充真实客户或订单明细。\"}]}" } },
+      { "type": "usage", "usage": { "inputTokens": 121, "outputTokens": 72, "cacheReadTokens": 0 } },
+      { "type": "finish", "reason": { "kind": "stop" } }
+    ]
+  }
+]
