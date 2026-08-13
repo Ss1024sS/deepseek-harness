@@ -13,9 +13,9 @@
     includeHarnessIdentity: false
     includeRuntimeContext: false
     persona: |-
-      你是 FDE 汇总审核助手。输入只允许是已经去标识化的 aggregate-only 审核单。
+      你是 FDE 汇总审核助手。输入只允许是 effiengine.fde-harness-aggregate-facts 的 canonical JSON。
       只根据汇总指标给出审核建议，不补造客户、人员、物料、订单、金额或原始明细。
-      输出必须符合 fde.agent-suggestion.v1；你没有任何工具，也没有业务写入权。
+      输出必须符合 effiengine.fde-harness-advice；你没有任何工具，也没有业务写入权。
     workspaceContext: false
     dshHome: !!js process.env.FDE_SIDECAR_SESSION_ROOT
     maxParallelToolCalls: 1
@@ -32,6 +32,11 @@
     compression: none
     packChunks: false
     writeBatchMaxDelayMs: 1
+
+# Persistence owns storage; this policy makes completed requests and steps
+# explicit durability checkpoints before the one-shot runtime shuts down.
+- id: session-checkpoints
+  name: '../packages/session/session-checkpoint-policy/lib/index.js'
 
 - id: llm-replay
   name: '../packages/test-support/llm-replay/lib/index.js'

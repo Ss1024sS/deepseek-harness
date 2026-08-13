@@ -1,104 +1,68 @@
-# FDE aggregate-only Harness sidecar P1 seam
+# FDE aggregate-only Harness sidecar P1
 
-This is a fixed-commit, keyless vertical slice over the official built JSON-RPC runtime. It is a lab prototype, not an FDE deployment.
+This is a macOS-only, fixed-commit, keyless replay experiment over the official DeepSeek Harness JSON-RPC runtime. It is not a cloud-model integration or an FDE deployment.
 
-## Input protocol
+## Exact one-shot contract
 
-The CLI accepts newline-delimited JSON. Every line must contain exactly one `fde.aggregate-review.v1` document. Unknown keys fail before the runtime starts; free-form customer, person, material, order, price, raw-row, attachment, path, URL, or instruction fields have no place in the schema.
-
-```json
-{
-  "schema": "fde.aggregate-review.v1",
-  "reviewId": "REV-FICTION-0001",
-  "projectRef": "PRJ-FICTION-ALPHA",
-  "aggregate": {
-    "assetRegistry": { "registered": 12, "ingested": 5, "installableSystems": 3 },
-    "quality": { "passed": 8, "total": 9 },
-    "workbench": { "screens": 4, "saveConnected": true },
-    "blockers": [{ "code": "DEMO_METADATA_GAP", "count": 2 }]
-  },
-  "privacy": {
-    "aggregateOnly": true,
-    "rawRowsIncluded": false,
-    "identifiersTokenized": true,
-    "sensitiveFieldsRemoved": true
-  }
-}
-```
-
-The caller starts one process per FDE project and sends lines serially:
+FDE starts one process for one request:
 
 ```sh
-export NVM_DIR="$HOME/.nvm"
-source "$NVM_DIR/nvm.sh"
-nvm use 22.22.0
-node fde-sidecar/sidecar.mjs \
-  --project-ref PRJ-FICTION-ALPHA \
-  --session-root /absolute/private/session-root \
-  < fde-sidecar/fixtures/aggregate-review.jsonl
+node <lab>/fde-sidecar/sidecar.mjs --session-root <absent-private-leaf>
 ```
 
-## Output protocol
+`<absent-private-leaf>` must be a fresh high-entropy path under an existing private parent. The sidecar exclusively creates the leaf as `0700`; an existing leaf fails closed. Stdin contains exactly one UTF-8 JSON line and then EOF. Stdout contains exactly one receipt or one stable-code error line and then exit. There is no daemon, reusable Session, project id, review id, browser token or approval token in this protocol.
 
-Each accepted line returns `{ "ok": true, "receipt": FdeSidecarReceipt }`. A rejected line returns `{ "ok": false, "error": { "code", "message" } }`, then the CLI closes the runtime and exits non-zero.
+The request has exact keys:
 
-The receipt keeps three meanings separate:
+```json
+{"schemaVersion":1,"kind":"effiengine.fde-harness-sidecar-request","outgoingDigest":"sha256:<64hex>","payload":{"schemaVersion":1,"kind":"effiengine.fde-harness-aggregate-facts","profile":"fde.aggregate-facts.v1","semantics":{},"facts":{}}}
+```
 
-- `messageId` proves durable admission to the Harness inbox.
-- `outcome.turn/reason` is accepted only when the observed interval contains exactly one matching receipt, one user message, one `turn/start`, one assistant message, one completed `turn/end`, zero tool events, then `idle`.
-- `authority: advisory-only` means the suggestion has no FDE Draft/save/compiler/assemble authority.
+The real payload schema is closed in `sidecar.mjs`. `outgoingDigest` must equal SHA-256 of recursively key-sorted, compact UTF-8 canonical payload bytes. The Harness prompt receives only those canonical payload bytes; wrapper, digest, project, review and privacy metadata never enter the Session.
 
-The adapter rejects concurrent work on the same Session with `SESSION_BUSY`. It does not pretend that upstream JSON-RPC has a per-prompt causal result. A timeout or ambiguous interval closes the entire runtime because the upstream protocol has no prompt cancel.
+Success is `effiengine.fde-harness-advice-receipt`. It is `ADVISORY_ONLY`, `KEYLESS_REPLAY`, `DENY_ALL_ENFORCED`, zero tools, zero cloud inference and zero FDE mutation. Runtime evidence binds the manifest, sidecar, enforced adapter profile and runtime artifact with distinct `sha256:` fields. There is no `runtimeProfileDigest`: macOS applies the adapter profile to the complete child tree, and reporting a second profile would falsely imply a second enforcement boundary. Failure is only:
 
-## Isolation actually exercised
+```json
+{"schemaVersion":1,"kind":"effiengine.fde-harness-sidecar-error","error":{"code":"<closed-code>"}}
+```
 
-- Official built runtime: `packages/examples/jsonrpc-demo/lib/bin.js` at upstream commit `47f943859bef60e4160492346772ded9b24f765a`.
-- Official stdio JSON-RPC methods: `initialize`, `session/prompt`, `shutdown`; notifications remain upstream `session.event` and `session.status`.
-- One sidecar owns one `HarnessClient`, which owns one runtime child. An exclusive project-root lock rejects a second active sidecar.
-- The project marker prevents reuse of one Session root by another project token or upstream commit.
-- Cordis composition contains no filesystem, shell, subprocess, terminal, MCP, subagent, workflow, web, telemetry, live LLM adapter, or model-facing tool.
-- macOS Seatbelt denies all runtime network operations and denies file writes outside the independent Session root. JSONL Session persistence is the only configured writer; the OS policy deliberately permits writes anywhere below that one private root.
-- The child environment is replaced, not inherited; no API key or FDE workspace path enters the runtime.
+No stderr, path, token or payload is reflected in an error.
 
-`llm-replay` is test infrastructure. It proves the assembled loop, JSON-RPC framing, event correlation and containment without a network request; it does not prove a cloud model's quality.
+## Security boundary actually exercised
 
-## Exact verification
+- The unsandboxed launcher verifies the canonical manifest and every pinned hash, creates a deny-default profile, and starts `/usr/bin/sandbox-exec`. It does not read, parse or validate stdin.
+- The sandboxed adapter is the first process that reads payload bytes. macOS refuses a nested `sandbox_init`, so adapter and official runtime share one deny-default Seatbelt boundary. The runtime is a child in the same process group, not detached.
+- The launcher gives the internal entry point a one-use, 256-bit nonce bound to a private-run proof file, the Session root, run root and manifest digest. The internal entry point consumes that proof and verifies that a known host file is denied before it reads stdin. Any public invocation that inherits either internal environment variable fails closed.
+- The adapter may fork and exec only the manifest-pinned Node binary. That grant is inherited by the runtime, so the runtime can re-exec only that same Node binary inside the same policy; it cannot exec `/bin/sh` or another binary. The tree may read only the fixed lab checkout plus its private run/Session roots, write only those private roots, and has no network permission.
+- Runtime `cwd` is a read-only bootstrap directory without `.env`; `DSH_CORDIS_CONFIG` is explicit. This closes the generic runner's cwd `.env` override seam.
+- The bounded client is local code, not upstream `HarnessClient`: 64 KiB frame, 128 frames, 512 KiB aggregate stdout, 32 KiB stderr, 16 KiB assistant text, 500 Unicode code points per summary, 300 per action, 5 s initialize, 15 s absolute turn deadline and 3 s cleanup.
+- Unknown notification/event, duplicate response, tool event, ambiguous/multiple assistant output, bounds, timeout, failed shutdown, trailing partial output or persistence mismatch fails closed. Both the runtime client and outer launcher wait for process close and stdio EOF, not merely child exit.
+- A receipt is returned only after official `shutdown`, process close with stdio EOF, and readback of the completed JSONL event sequence. Apart from the validated Session header, the durable sequence must be byte-equivalent to the bounded wire-event sequence with exact type closure, cardinality and order; durable-only tools, unknown events, or extra user/assistant/turn events fail closed.
 
-From a fresh clone of the fork, check out the experiment branch based on the fixed upstream commit. The build creates ignored `lib/` artifacts required by the sidecar; they are not part of this branch. Do not substitute `npx` for the repository-pinned package manager.
+Seatbelt is defense in depth against the contained process tree. It does not defend against another malicious process already running as the same macOS user or against compromise of the unsandboxed FDE launcher.
+
+## Fixed fresh-clone closure
+
+The experiment is based on upstream commit `47f943859bef60e4160492346772ded9b24f765a`. The repository pins `pnpm@11.7.0`; do not substitute `npx` or a global pnpm.
 
 ```sh
 git fetch origin lab/fde-aggregate-sidecar-p1
 git checkout --detach origin/lab/fde-aggregate-sidecar-p1
-test "$(git merge-base 47f943859bef60e4160492346772ded9b24f765a HEAD)" = "47f943859bef60e4160492346772ded9b24f765a"
-test -z "$(git diff --name-only 47f943859bef60e4160492346772ded9b24f765a HEAD -- . ':(exclude)fde-sidecar/**')"
+test "$(git merge-base 47f943859bef60e4160492346772ded9b24f765a HEAD)" = 47f943859bef60e4160492346772ded9b24f765a
 export NVM_DIR="$HOME/.nvm"
 source "$NVM_DIR/nvm.sh"
 nvm use 22.22.0
-test "$(node --version)" = "v22.22.0"
-test "$(corepack pnpm --version)" = "11.7.0"
+test "$(node --version)" = v22.22.0
+test "$(corepack pnpm --version)" = 11.7.0
 corepack pnpm install --frozen-lockfile
 corepack pnpm run build:lib
 corepack pnpm exec vitest run --config fde-sidecar/vitest.config.mjs
 ```
 
-The test proves schema rejection, the real newline-JSON CLI boundary, two serial turns on one Session, concurrent-call refusal, one-active-process project locking, two-project separation, zero model-facing tools, no tool events, append-only Session output, and Seatbelt denial of network and out-of-root writes.
+`runtime-manifest.json` is canonical JSON and has no self-hash. `node.path` and all artifact paths resolve relative to the manifest's parent directory. The caller must separately pin the entire manifest SHA-256; calculating and approving it in the same startup is not an approval boundary.
 
-## Release boundary
+## Verified / not verified
 
-- This is a macOS-only experiment because confinement calls `/usr/bin/sandbox-exec`; no Linux or container profile exists.
-- The dedicated Vitest config is not included by the repository's default test inventory or CI.
-- The only model path is keyless replay. No cloud model, provider credential, retention policy or output-quality acceptance is exercised.
-- Nothing here is integrated into, deployed with or enabled in FDE.
+The dedicated tests run a real public CLI replay, verify canonical request admission, fixed manifest/Node, fresh random Sessions, exact JSONL persistence after shutdown, payload-first-read placement, one-use launch proof, external-marker injection rejection, absent-leaf ownership, and Seatbelt denial of host read/write/network/unpinned exec. Durable-only tool and assistant counterexamples, as well as trailing unknown, duplicate and partial JSON-RPC output, remain red. These tests do not run through the repository default CI inventory.
 
-## FDE P1 minimum seam
-
-FDE owns `FdeAggregateSidecar`; the sidecar never owns an FDE repository, Draft or deployment credential.
-
-1. FDE computes and validates the aggregate review document locally.
-2. The privacy layer signs or records its own approval before calling this adapter; this prototype only validates the narrow document shape and privacy assertions.
-3. The adapter starts one fixed-runtime process for that project, initializes the replay/cloud route, and submits one line only while the Session is idle.
-4. The adapter returns a receipt containing input digest, `messageId`, turn reason, event digest, exact event types, runtime/profile fingerprint and a parsed suggestion.
-5. FDE renders the suggestion in an untrusted “AI 建议” panel. A human may copy/accept it into a Draft through existing FDE actions.
-6. Existing save, compiler, digest, assemble, repository quality, deployment and browser gates remain authoritative and unchanged.
-
-Before replacing replay with a cloud adapter, P1 still needs an out-of-process Privacy Gateway, Token Vault, `llm/stream` outbound DLP guard, destination allowlist, encrypted Session persistence or encrypted volume, Linux/container confinement, cloud-retention policy, canary leak tests, and deployment/browser acceptance. None is implied by this keyless slice.
+Not verified or delivered: Linux/container confinement, cloud provider, credentials, DLP/token vault, model quality, multi-user authorization, FDE deployment, Tencent deployment, browser acceptance or production retention policy. Replacing replay with a cloud adapter requires a separate privacy gateway and release gate; this experiment makes no such claim.

@@ -1,475 +1,864 @@
 #!/usr/bin/env node
 
-import { createHash, randomUUID } from 'node:crypto'
-import { open, mkdir, readFile, realpath, unlink, writeFile } from 'node:fs/promises'
-import { basename, join, resolve } from 'node:path'
+import { spawn } from 'node:child_process'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { chmod, mkdir, readFile, realpath, stat, unlink } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { createInterface } from 'node:readline'
-import { HarnessClient } from '../packages/sdk/client/lib/index.js'
 
 const UPSTREAM_COMMIT = '47f943859bef60e4160492346772ded9b24f765a'
+const REQUEST_KIND = 'effiengine.fde-harness-sidecar-request'
+const PAYLOAD_KIND = 'effiengine.fde-harness-aggregate-facts'
+const RECEIPT_KIND = 'effiengine.fde-harness-advice-receipt'
+const ADVICE_KIND = 'effiengine.fde-harness-advice'
+const ERROR_KIND = 'effiengine.fde-harness-sidecar-error'
 const SERVER_NAME = 'deepseek-harness-sdk-runtime'
 const SERVER_VERSION = '0.0.1'
-const INPUT_SCHEMA = 'fde.aggregate-review.v1'
-const OUTPUT_SCHEMA = 'fde.agent-suggestion.v1'
-const RECEIPT_SCHEMA = 'fde.sidecar-receipt.v1'
-const MAX_INPUT_BYTES = 8192
-const DEFAULT_TURN_TIMEOUT_MS = 15_000
+const MAX_INPUT_LINE_BYTES = 64 * 1024
+const MAX_FRAME_BYTES = 64 * 1024
+const MAX_FRAMES = 128
+const MAX_TOTAL_FRAME_BYTES = 512 * 1024
+const MAX_STDERR_BYTES = 32 * 1024
+const MAX_ASSISTANT_BYTES = 16 * 1024
+const INITIALIZE_TIMEOUT_MS = 5_000
+const TURN_TIMEOUT_MS = 15_000
+const CLEANUP_TIMEOUT_MS = 3_000
+const MAX_SUMMARY_CODE_POINTS = 500
+const MAX_ACTION_TEXT_CODE_POINTS = 300
+const MAX_ACTIONS = 8
 
 const labRoot = fileURLToPath(new URL('../', import.meta.url))
-const defaultConfig = join(labRoot, 'fde-sidecar', 'cordis.yml')
-const defaultRuntime = join(labRoot, 'packages', 'examples', 'jsonrpc-demo', 'lib', 'bin.js')
-const defaultProfile = join(labRoot, 'fde-sidecar', 'runtime.sb')
-const defaultReplayFile = join(labRoot, 'fde-sidecar', 'replay', 'session.jsonl')
-const defaultReplayOverride = join(labRoot, 'fde-sidecar', 'replay', 'replay.override.json')
+const sidecarRoot = join(labRoot, 'fde-sidecar')
+const defaults = {
+  manifest: join(sidecarRoot, 'runtime-manifest.json'),
+  config: join(sidecarRoot, 'cordis.yml'),
+  adapterProfile: join(sidecarRoot, 'adapter.sb'),
+  replayFile: join(sidecarRoot, 'replay', 'session.jsonl'),
+  replayOverride: join(sidecarRoot, 'replay', 'replay.override.json'),
+  runtime: join(labRoot, 'packages', 'examples', 'jsonrpc-demo', 'lib', 'bin.js'),
+}
+
+const STATUS_VALUES = new Set([
+  'BLOCKED', 'NOT_APPLICABLE', 'NOT_MEASURED', 'NOT_PROBED', 'PASS',
+  'absent', 'candidate', 'customer', 'default', 'design', 'local_only',
+  'missing', 'not_selected', 'pilot', 'snapshot_only', 'stable',
+  'unavailable', 'unverified',
+])
+const FINDING_CODES = new Set([
+  'CANDIDATE_ACTION_NOT_INSTALLABLE', 'CONFIG_ABOVE_MAXIMUM',
+  'CONFIG_BELOW_MINIMUM', 'CONFIG_INVALID_TYPE', 'CONFIG_MISSING',
+  'CONFIG_NOT_IN_ENUM', 'CONFIG_UNRESOLVED', 'CONTRACT_CONFLICT',
+  'CONTRACT_DEPENDENCY_MISSING', 'CONTRACT_SYSTEM_NOT_SELECTED',
+  'EXTERNAL_URL_SOURCE_CONFLICT', 'EXTERNAL_URL_SOURCE_MISSING',
+  'INACTIVE_CONTRACT_CONFIG', 'OPTIONAL_CONTRACT_UNAVAILABLE',
+  'PLATFORM_REQUIRED', 'PORT_BINDING_MISSING', 'PORT_CAPABILITY_MISSING',
+  'PORT_NOT_AVAILABLE_IN_SNAPSHOT', 'PROVIDER_EVIDENCE_MISMATCH',
+  'SYSTEM_DEPENDENCY_MISSING', 'SYSTEM_NOT_FOUND',
+])
+const COUNT_KEYS = [
+  'requestedSystems', 'resolvedSystems', 'selectedContracts', 'dependencyEdges',
+  'contractDependencyEdges', 'requestedExternal', 'contracts', 'configurationSlots',
+  'capabilityGaps', 'routes', 'artifacts', 'blockers', 'warnings',
+]
+const EVIDENCE_KEYS = [
+  'portsByStatus', 'actionsByStatus', 'contractsByMaturity',
+  'configurationSlotsByStatus', 'configurationSlotsBySource', 'gapsByStatus',
+  'syncRuntimeHealthByStatus', 'syncFreshnessByStatus',
+]
+const ALLOWED_EVENT_TYPES = new Set([
+  'agent/inbox/spliced', 'turn/start', 'step/start', 'user/message',
+  'session/title', 'request/header', 'request/context', 'assistant/chunk',
+  'assistant/message', 'step/end', 'turn/end',
+])
+const ERROR_CODES = new Set([
+  'INVALID_REQUEST', 'DIGEST_MISMATCH', 'INPUT_TOO_LARGE', 'MULTIPLE_REQUESTS',
+  'MANIFEST_INVALID', 'MANIFEST_DRIFT', 'PLATFORM_UNSUPPORTED', 'SANDBOX_FAILURE',
+  'RUNTIME_START_FAILED', 'INITIALIZE_TIMEOUT', 'TURN_TIMEOUT', 'FRAME_TOO_LARGE',
+  'FRAME_LIMIT_EXCEEDED', 'OUTPUT_LIMIT_EXCEEDED', 'STDERR_LIMIT_EXCEEDED',
+  'PROTOCOL_VIOLATION', 'UNKNOWN_NOTIFICATION', 'UNKNOWN_EVENT', 'TOOLS_EXPOSED',
+  'AMBIGUOUS_RESULT', 'INVALID_MODEL_OUTPUT', 'PERSISTENCE_NOT_PROVEN',
+  'CLEANUP_FAILED', 'SIDECAR_FAILURE',
+])
 
 export class SidecarError extends Error {
-  constructor(code, message, cause) {
-    super(message, cause === undefined ? undefined : { cause })
+  constructor(code) {
+    super(code)
     this.name = 'SidecarError'
-    this.code = code
+    this.code = ERROR_CODES.has(code) ? code : 'SIDECAR_FAILURE'
   }
 }
 
-function record(value, at) {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    throw new SidecarError('INVALID_INPUT', `${at} must be an object`)
-  }
+function record(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) throw new SidecarError('INVALID_REQUEST')
   return value
 }
 
-function exactKeys(value, expected, at) {
+function exactKeys(value, expected, code = 'INVALID_REQUEST') {
   const actual = Object.keys(value).sort()
   const wanted = [...expected].sort()
   if (actual.length !== wanted.length || actual.some((key, index) => key !== wanted[index])) {
-    throw new SidecarError('INVALID_INPUT', `${at} keys must be exactly: ${wanted.join(', ')}`)
+    throw new SidecarError(code)
   }
 }
 
-function boundedToken(value, pattern, at) {
-  if (typeof value !== 'string' || !pattern.test(value)) {
-    throw new SidecarError('INVALID_INPUT', `${at} is not an allowed token`)
-  }
-  return value
+function nonnegativeInteger(value) {
+  if (!Number.isSafeInteger(value) || value < 0) throw new SidecarError('INVALID_REQUEST')
 }
 
-function nonnegativeInteger(value, at) {
-  if (!Number.isSafeInteger(value) || value < 0) {
-    throw new SidecarError('INVALID_INPUT', `${at} must be a non-negative safe integer`)
-  }
-  return value
+function boolean(value) {
+  if (typeof value !== 'boolean') throw new SidecarError('INVALID_REQUEST')
 }
 
-function requiredBoolean(value, expected, at) {
-  if (value !== expected) {
-    throw new SidecarError('PRIVACY_POLICY_REJECTED', `${at} must be ${String(expected)}`)
+function validateStatusCounts(value) {
+  if (!Array.isArray(value) || value.length > STATUS_VALUES.size) throw new SidecarError('INVALID_REQUEST')
+  const seen = new Set()
+  for (const itemValue of value) {
+    const item = record(itemValue)
+    exactKeys(item, ['status', 'count'])
+    if (!STATUS_VALUES.has(item.status) || seen.has(item.status)) throw new SidecarError('INVALID_REQUEST')
+    nonnegativeInteger(item.count)
+    seen.add(item.status)
   }
-  return value
 }
 
-export function validateAggregateReview(value, expectedProjectRef) {
-  const input = record(value, 'input')
-  exactKeys(input, ['schema', 'reviewId', 'projectRef', 'aggregate', 'privacy'], 'input')
-  if (input.schema !== INPUT_SCHEMA) throw new SidecarError('INVALID_INPUT', `schema must be ${INPUT_SCHEMA}`)
-  const reviewId = boundedToken(input.reviewId, /^REV-[A-Z0-9-]{1,48}$/, 'reviewId')
-  const projectRef = boundedToken(input.projectRef, /^PRJ-[A-Z0-9-]{1,48}$/, 'projectRef')
-  if (projectRef !== expectedProjectRef) {
-    throw new SidecarError('PROJECT_MISMATCH', `input projectRef ${projectRef} does not match this sidecar`)
+function validateFindingCounts(value) {
+  if (!Array.isArray(value) || value.length > FINDING_CODES.size) throw new SidecarError('INVALID_REQUEST')
+  const seen = new Set()
+  for (const itemValue of value) {
+    const item = record(itemValue)
+    exactKeys(item, ['code', 'count'])
+    if (!FINDING_CODES.has(item.code) || seen.has(item.code)) throw new SidecarError('INVALID_REQUEST')
+    nonnegativeInteger(item.count)
+    seen.add(item.code)
   }
-
-  const aggregate = record(input.aggregate, 'aggregate')
-  exactKeys(aggregate, ['assetRegistry', 'quality', 'workbench', 'blockers'], 'aggregate')
-  const assetRegistry = record(aggregate.assetRegistry, 'aggregate.assetRegistry')
-  exactKeys(assetRegistry, ['registered', 'ingested', 'installableSystems'], 'aggregate.assetRegistry')
-  nonnegativeInteger(assetRegistry.registered, 'aggregate.assetRegistry.registered')
-  nonnegativeInteger(assetRegistry.ingested, 'aggregate.assetRegistry.ingested')
-  nonnegativeInteger(assetRegistry.installableSystems, 'aggregate.assetRegistry.installableSystems')
-  if (assetRegistry.ingested > assetRegistry.registered) {
-    throw new SidecarError('INVALID_INPUT', 'ingested cannot exceed registered')
-  }
-
-  const quality = record(aggregate.quality, 'aggregate.quality')
-  exactKeys(quality, ['passed', 'total'], 'aggregate.quality')
-  nonnegativeInteger(quality.passed, 'aggregate.quality.passed')
-  nonnegativeInteger(quality.total, 'aggregate.quality.total')
-  if (quality.passed > quality.total) throw new SidecarError('INVALID_INPUT', 'quality passed cannot exceed total')
-
-  const workbench = record(aggregate.workbench, 'aggregate.workbench')
-  exactKeys(workbench, ['screens', 'saveConnected'], 'aggregate.workbench')
-  nonnegativeInteger(workbench.screens, 'aggregate.workbench.screens')
-  if (typeof workbench.saveConnected !== 'boolean') {
-    throw new SidecarError('INVALID_INPUT', 'aggregate.workbench.saveConnected must be boolean')
-  }
-
-  if (!Array.isArray(aggregate.blockers) || aggregate.blockers.length > 20) {
-    throw new SidecarError('INVALID_INPUT', 'aggregate.blockers must be an array of at most 20 items')
-  }
-  for (const [index, rawBlocker] of aggregate.blockers.entries()) {
-    const blocker = record(rawBlocker, `aggregate.blockers[${index}]`)
-    exactKeys(blocker, ['code', 'count'], `aggregate.blockers[${index}]`)
-    boundedToken(blocker.code, /^[A-Z][A-Z0-9_]{1,47}$/, `aggregate.blockers[${index}].code`)
-    nonnegativeInteger(blocker.count, `aggregate.blockers[${index}].count`)
-  }
-
-  const privacy = record(input.privacy, 'privacy')
-  exactKeys(privacy, ['aggregateOnly', 'rawRowsIncluded', 'identifiersTokenized', 'sensitiveFieldsRemoved'], 'privacy')
-  requiredBoolean(privacy.aggregateOnly, true, 'privacy.aggregateOnly')
-  requiredBoolean(privacy.rawRowsIncluded, false, 'privacy.rawRowsIncluded')
-  requiredBoolean(privacy.identifiersTokenized, true, 'privacy.identifiersTokenized')
-  requiredBoolean(privacy.sensitiveFieldsRemoved, true, 'privacy.sensitiveFieldsRemoved')
-
-  const canonical = JSON.stringify(input)
-  if (Buffer.byteLength(canonical) > MAX_INPUT_BYTES) {
-    throw new SidecarError('INVALID_INPUT', `input exceeds ${MAX_INPUT_BYTES} bytes`)
-  }
-  return { input, canonical, reviewId, projectRef }
 }
 
-function parseSuggestion(text) {
-  let value
-  try {
-    value = JSON.parse(text)
-  } catch (error) {
-    throw new SidecarError('INVALID_MODEL_OUTPUT', 'model output is not JSON', error)
+export function canonicalJson(value) {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value)
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (typeof value === 'object') {
+    return `{${Object.entries(value).sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(',')}}`
   }
-  const suggestion = record(value, 'suggestion')
-  exactKeys(suggestion, ['schema', 'verdict', 'summary', 'actions'], 'suggestion')
-  if (suggestion.schema !== OUTPUT_SCHEMA) {
-    throw new SidecarError('INVALID_MODEL_OUTPUT', `suggestion schema must be ${OUTPUT_SCHEMA}`)
-  }
-  if (!['ready-with-conditions', 'manual-review', 'blocked'].includes(suggestion.verdict)) {
-    throw new SidecarError('INVALID_MODEL_OUTPUT', 'suggestion verdict is not allowed')
-  }
-  if (typeof suggestion.summary !== 'string' || suggestion.summary.length === 0 || suggestion.summary.length > 500) {
-    throw new SidecarError('INVALID_MODEL_OUTPUT', 'suggestion summary must contain 1-500 characters')
-  }
-  if (!Array.isArray(suggestion.actions) || suggestion.actions.length > 8) {
-    throw new SidecarError('INVALID_MODEL_OUTPUT', 'suggestion actions must be an array of at most 8 items')
-  }
-  for (const [index, rawAction] of suggestion.actions.entries()) {
-    const action = record(rawAction, `suggestion.actions[${index}]`)
-    exactKeys(action, ['code', 'priority', 'text'], `suggestion.actions[${index}]`)
-    boundedToken(action.code, /^[A-Z][A-Z0-9_]{1,47}$/, `suggestion.actions[${index}].code`)
-    if (!['P0', 'P1', 'P2', 'P3'].includes(action.priority)) {
-      throw new SidecarError('INVALID_MODEL_OUTPUT', `suggestion.actions[${index}].priority is not allowed`)
-    }
-    if (typeof action.text !== 'string' || action.text.length === 0 || action.text.length > 300) {
-      throw new SidecarError('INVALID_MODEL_OUTPUT', `suggestion.actions[${index}].text must contain 1-300 characters`)
-    }
-  }
-  return suggestion
-}
-
-function eventEnvelope(notification) {
-  if (notification.method !== 'session.event') return undefined
-  const event = notification.params.event
-  return event !== null && typeof event === 'object' && typeof event.type === 'string' ? event : undefined
-}
-
-function isReceipt(event, messageId) {
-  if (event?.type !== 'agent/inbox/spliced') return false
-  const inserted = event.data?.inserted
-  return Array.isArray(inserted) && inserted.some(message => message?.id === messageId)
-}
-
-function textOfAssistant(event) {
-  if (event?.type !== 'assistant/message') return undefined
-  const content = event.data?.message?.content
-  if (!Array.isArray(content) || !content.every(block => block?.type === 'text' && typeof block.text === 'string')) {
-    throw new SidecarError('AMBIGUOUS_RESULT', 'assistant response contains a non-text block')
-  }
-  return content.map(block => block.text).join('')
+  throw new SidecarError('INVALID_REQUEST')
 }
 
 function sha256(value) {
+  return `sha256:${createHash('sha256').update(value).digest('hex')}`
+}
+
+function sha256Hex(value) {
   return createHash('sha256').update(value).digest('hex')
 }
 
-function timeout(promise, ms, label) {
-  let timer
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new SidecarError('TURN_TIMEOUT', `${label} exceeded ${ms}ms`)), ms)
-    }),
-  ]).finally(() => clearTimeout(timer))
+function validatePayload(value) {
+  const payload = record(value)
+  exactKeys(payload, ['schemaVersion', 'kind', 'profile', 'semantics', 'facts'])
+  if (payload.schemaVersion !== 1 || payload.kind !== PAYLOAD_KIND || payload.profile !== 'fde.aggregate-facts.v1') {
+    throw new SidecarError('INVALID_REQUEST')
+  }
+  const semantics = record(payload.semantics)
+  exactKeys(semantics, [
+    'authority', 'evidenceClass', 'assemblyExecuted', 'deploymentExecuted',
+    'runtimeProbeExecuted', 'businessAcceptanceProven',
+  ])
+  if (semantics.authority !== 'ADVISORY_ONLY'
+    || semantics.evidenceClass !== 'STATIC_COMPILER_PROJECTION'
+    || semantics.assemblyExecuted !== false
+    || semantics.deploymentExecuted !== false
+    || semantics.runtimeProbeExecuted !== false
+    || semantics.businessAcceptanceProven !== false) throw new SidecarError('INVALID_REQUEST')
+
+  const facts = record(payload.facts)
+  exactKeys(facts, ['plan', 'counts', 'acceptance', 'findings', 'evidence'])
+  const plan = record(facts.plan)
+  exactKeys(plan, ['status', 'canAssemble', 'lockWouldWrite'])
+  if (!['READY', 'BLOCKED'].includes(plan.status)) throw new SidecarError('INVALID_REQUEST')
+  boolean(plan.canAssemble)
+  boolean(plan.lockWouldWrite)
+
+  const counts = record(facts.counts)
+  exactKeys(counts, COUNT_KEYS)
+  for (const key of COUNT_KEYS) nonnegativeInteger(counts[key])
+
+  const acceptance = record(facts.acceptance)
+  exactKeys(acceptance, ['declared', 'structurallyValidated', 'executable', 'executed', 'status'])
+  for (const key of ['declared', 'structurallyValidated', 'executable', 'executed']) nonnegativeInteger(acceptance[key])
+  if (!['NOT_RUN', 'SPEC_ONLY'].includes(acceptance.status)) throw new SidecarError('INVALID_REQUEST')
+
+  const findings = record(facts.findings)
+  exactKeys(findings, ['blockersByCode', 'warningsByCode'])
+  validateFindingCounts(findings.blockersByCode)
+  validateFindingCounts(findings.warningsByCode)
+
+  const evidence = record(facts.evidence)
+  exactKeys(evidence, EVIDENCE_KEYS)
+  for (const key of EVIDENCE_KEYS) validateStatusCounts(evidence[key])
+  return payload
 }
 
-function verifyStrictInterval(events, messageId) {
-  if (!isReceipt(events[0], messageId)) {
-    throw new SidecarError('AMBIGUOUS_RESULT', 'interval does not start at the matching durable inbox receipt')
+export function validateRequest(value) {
+  const wrapper = record(value)
+  exactKeys(wrapper, ['schemaVersion', 'kind', 'outgoingDigest', 'payload'])
+  if (wrapper.schemaVersion !== 1 || wrapper.kind !== REQUEST_KIND
+    || typeof wrapper.outgoingDigest !== 'string'
+    || !/^sha256:[0-9a-f]{64}$/.test(wrapper.outgoingDigest)) throw new SidecarError('INVALID_REQUEST')
+  const payload = validatePayload(wrapper.payload)
+  const payloadCanonical = canonicalJson(payload)
+  if (sha256(payloadCanonical) !== wrapper.outgoingDigest) throw new SidecarError('DIGEST_MISMATCH')
+  return { outgoingDigest: wrapper.outgoingDigest, payloadCanonical }
+}
+
+function safeText(value, maxCharacters) {
+  if (typeof value !== 'string' || value.length === 0 || [...value].length > maxCharacters
+    || /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069<>]/u.test(value)) {
+    throw new SidecarError('INVALID_MODEL_OUTPUT')
   }
-  const matchingReceipts = events.filter(event => isReceipt(event, messageId))
-  const otherInsertions = events.filter(event => event.type === 'agent/inbox/spliced'
+  return value
+}
+
+export function parseAdvice(text) {
+  if (Buffer.byteLength(text) > MAX_ASSISTANT_BYTES) throw new SidecarError('OUTPUT_LIMIT_EXCEEDED')
+  let value
+  try { value = JSON.parse(text) } catch { throw new SidecarError('INVALID_MODEL_OUTPUT') }
+  const advice = record(value)
+  exactKeys(advice, ['schemaVersion', 'kind', 'verdict', 'summary', 'actions'], 'INVALID_MODEL_OUTPUT')
+  if (advice.schemaVersion !== 1 || advice.kind !== ADVICE_KIND
+    || !['READY_WITH_CONDITIONS', 'MANUAL_REVIEW', 'BLOCKED'].includes(advice.verdict)) {
+    throw new SidecarError('INVALID_MODEL_OUTPUT')
+  }
+  safeText(advice.summary, MAX_SUMMARY_CODE_POINTS)
+  if (!Array.isArray(advice.actions) || advice.actions.length > MAX_ACTIONS) throw new SidecarError('INVALID_MODEL_OUTPUT')
+  for (const actionValue of advice.actions) {
+    const action = record(actionValue)
+    exactKeys(action, ['priority', 'text'], 'INVALID_MODEL_OUTPUT')
+    if (!['P0', 'P1', 'P2', 'P3'].includes(action.priority)) throw new SidecarError('INVALID_MODEL_OUTPUT')
+    safeText(action.text, MAX_ACTION_TEXT_CODE_POINTS)
+  }
+  return advice
+}
+
+async function canonicalPathInside(path, root) {
+  const canonical = await realpath(path)
+  const canonicalRoot = await realpath(root)
+  if (canonical !== canonicalRoot && !canonical.startsWith(`${canonicalRoot}/`)) throw new SidecarError('MANIFEST_INVALID')
+  return canonical
+}
+
+async function digestFile(path) {
+  return sha256Hex(await readFile(path))
+}
+
+function validateManifestShape(value) {
+  const manifest = record(value)
+  exactKeys(manifest, [
+    'schemaVersion', 'kind', 'upstreamCommit', 'node', 'sidecar', 'config',
+    'adapterProfile', 'replaySession', 'replayOverride', 'runtimeArtifact',
+  ], 'MANIFEST_INVALID')
+  if (manifest.schemaVersion !== 1 || manifest.kind !== 'effiengine.fde-harness-runtime-manifest'
+    || manifest.upstreamCommit !== UPSTREAM_COMMIT) throw new SidecarError('MANIFEST_INVALID')
+  const node = record(manifest.node)
+  exactKeys(node, ['path', 'version', 'sha256'], 'MANIFEST_INVALID')
+  if (typeof node.path !== 'string' || node.path === '' || node.path.startsWith('/') || node.path.includes('\0')
+    || node.version !== 'v22.22.0' || !/^[0-9a-f]{64}$/.test(node.sha256)) {
+    throw new SidecarError('MANIFEST_INVALID')
+  }
+  for (const key of ['sidecar', 'config', 'adapterProfile', 'replaySession', 'replayOverride', 'runtimeArtifact']) {
+    const item = record(manifest[key])
+    exactKeys(item, ['path', 'sha256'], 'MANIFEST_INVALID')
+    if (typeof item.path !== 'string' || item.path === '' || item.path.startsWith('/') || item.path.includes('\0')
+      || !/^[0-9a-f]{64}$/.test(item.sha256)) throw new SidecarError('MANIFEST_INVALID')
+  }
+  return manifest
+}
+
+export async function verifyRuntimeManifest(options = {}) {
+  const manifestPath = resolve(options.manifestPath ?? defaults.manifest)
+  const raw = await readFile(manifestPath)
+  let parsed
+  try { parsed = JSON.parse(raw) } catch { throw new SidecarError('MANIFEST_INVALID') }
+  const manifest = validateManifestShape(parsed)
+  if (Buffer.compare(raw, Buffer.from(`${canonicalJson(manifest)}\n`)) !== 0) throw new SidecarError('MANIFEST_INVALID')
+  const manifestDir = dirname(manifestPath)
+  const paths = {}
+  for (const key of ['sidecar', 'config', 'adapterProfile', 'replaySession', 'replayOverride', 'runtimeArtifact']) {
+    const path = await canonicalPathInside(resolve(manifestDir, manifest[key].path), labRoot)
+    if (await digestFile(path) !== manifest[key].sha256) throw new SidecarError('MANIFEST_DRIFT')
+    paths[key] = path
+  }
+  const nodePath = await realpath(resolve(manifestDir, manifest.node.path))
+  if (await realpath(process.execPath) !== nodePath || process.version !== manifest.node.version
+    || await digestFile(nodePath) !== manifest.node.sha256) {
+    throw new SidecarError('MANIFEST_DRIFT')
+  }
+  return {
+    manifest,
+    manifestDigest: sha256Hex(raw),
+    paths,
+    nodePath,
+  }
+}
+
+function replaceProfileParameters(template, parameters) {
+  let result = template
+  for (const [name, value] of Object.entries(parameters)) {
+    const escaped = value.replaceAll('\\', '\\\\').replaceAll('"', '\\"')
+    result = result.replaceAll(`@@${name}@@`, escaped)
+  }
+  if (/@@[A-Z_]+@@/.test(result)) throw new SidecarError('SANDBOX_FAILURE')
+  return result
+}
+
+async function writePrivateFile(path, content) {
+  const { open } = await import('node:fs/promises')
+  const handle = await open(path, 'wx', 0o600)
+  try { await handle.writeFile(content) } finally { await handle.close() }
+}
+
+function deadlinePromise(deadline, code) {
+  const remaining = deadline - Date.now()
+  if (remaining <= 0) return Promise.reject(new SidecarError(code))
+  return new Promise((_, reject) => {
+    const timer = setTimeout(() => reject(new SidecarError(code)), remaining)
+    timer.unref?.()
+  })
+}
+
+export class BoundedJsonRpcClient {
+  constructor({ nodePath, runtimePath, configPath, sessionRoot, runtimeTmp, bootstrapRoot, replayFile, replayOverride }) {
+    this.nextId = 1
+    this.pending = new Map()
+    this.notifications = []
+    this.waiters = []
+    this.frameCount = 0
+    this.totalFrameBytes = 0
+    this.stderrBytes = 0
+    this.stdoutBuffer = Buffer.alloc(0)
+    const env = {
+      PATH: '/usr/bin:/bin',
+      TMPDIR: runtimeTmp,
+      DSH_CORDIS_CONFIG: configPath,
+      FDE_SIDECAR_SESSION_ROOT: sessionRoot,
+      FDE_SIDECAR_REPLAY_FILE: replayFile,
+      FDE_SIDECAR_REPLAY_OVERRIDE: replayOverride,
+      NARB_DISABLE_NATIVE_CACHE: '1',
+      NODE_OPTIONS: '--disable-warning=ExperimentalWarning',
+    }
+    this.child = spawn(nodePath, [runtimePath, configPath], {
+      cwd: bootstrapRoot,
+      env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      // The public launcher puts this adapter and its child runtime under one
+      // deny-default Seatbelt profile. Keep the complete child tree in the
+      // caller-owned process group.
+      detached: false,
+    })
+    this.child.stdin.on('error', () => {})
+    this.child.stdout.on('data', chunk => this.onStdout(chunk))
+    this.child.stderr.on('data', chunk => {
+      this.stderrBytes += chunk.length
+      if (this.stderrBytes > MAX_STDERR_BYTES) this.fail(new SidecarError('STDERR_LIMIT_EXCEEDED'))
+    })
+    this.closeTask = new Promise(resolveClose => this.child.once('close', (code, signal) => {
+      if (!this.closing) this.fail(new SidecarError('PROTOCOL_VIOLATION'))
+      resolveClose({ code, signal })
+    }))
+    this.child.once('error', () => this.fail(new SidecarError('RUNTIME_START_FAILED')))
+  }
+
+  onStdout(chunk) {
+    if (this.failed) return
+    this.stdoutBuffer = Buffer.concat([this.stdoutBuffer, chunk])
+    if (this.stdoutBuffer.length > MAX_FRAME_BYTES && !this.stdoutBuffer.includes(0x0a)) {
+      this.fail(new SidecarError('FRAME_TOO_LARGE'))
+      return
+    }
+    for (;;) {
+      const newline = this.stdoutBuffer.indexOf(0x0a)
+      if (newline < 0) return
+      const line = this.stdoutBuffer.subarray(0, newline)
+      this.stdoutBuffer = this.stdoutBuffer.subarray(newline + 1)
+      if (line.length === 0 || line.length > MAX_FRAME_BYTES) {
+        this.fail(new SidecarError(line.length > MAX_FRAME_BYTES ? 'FRAME_TOO_LARGE' : 'PROTOCOL_VIOLATION'))
+        return
+      }
+      this.frameCount += 1
+      this.totalFrameBytes += line.length + 1
+      if (this.frameCount > MAX_FRAMES) return this.fail(new SidecarError('FRAME_LIMIT_EXCEEDED'))
+      if (this.totalFrameBytes > MAX_TOTAL_FRAME_BYTES) return this.fail(new SidecarError('OUTPUT_LIMIT_EXCEEDED'))
+      let frame
+      try { frame = JSON.parse(line.toString('utf8')) } catch { return this.fail(new SidecarError('PROTOCOL_VIOLATION')) }
+      try { this.dispatch(frame) } catch (error) { this.fail(error) }
+    }
+  }
+
+  dispatch(value) {
+    const frame = record(value)
+    if (frame.jsonrpc !== '2.0') throw new SidecarError('PROTOCOL_VIOLATION')
+    if ((typeof frame.id === 'string' || typeof frame.id === 'number') && frame.method === undefined) {
+      exactKeys(frame, ['jsonrpc', 'id', 'result'], 'PROTOCOL_VIOLATION')
+      const key = String(frame.id)
+      const pending = this.pending.get(key)
+      if (pending === undefined) throw new SidecarError('PROTOCOL_VIOLATION')
+      this.pending.delete(key)
+      if ('error' in frame || !('result' in frame)) throw new SidecarError('PROTOCOL_VIOLATION')
+      pending.resolve(frame.result)
+      return
+    }
+    exactKeys(frame, ['jsonrpc', 'method', 'params'], 'PROTOCOL_VIOLATION')
+    if (!['session.event', 'session.status'].includes(frame.method)) throw new SidecarError('UNKNOWN_NOTIFICATION')
+    const params = record(frame.params)
+    const waiter = this.waiters.shift()
+    if (waiter !== undefined) waiter.resolve({ method: frame.method, params })
+    else this.notifications.push({ method: frame.method, params })
+  }
+
+  request(method, params, deadline, timeoutCode) {
+    if (this.failed) return Promise.reject(this.failed)
+    const id = this.nextId++
+    const frame = `${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`
+    const response = new Promise((resolveResponse, rejectResponse) => {
+      this.pending.set(String(id), { resolve: resolveResponse, reject: rejectResponse })
+      this.child.stdin.write(frame, error => {
+        if (error) {
+          this.pending.delete(String(id))
+          rejectResponse(new SidecarError('PROTOCOL_VIOLATION'))
+        }
+      })
+    })
+    return Promise.race([response, deadlinePromise(deadline, timeoutCode)])
+  }
+
+  nextNotification(deadline) {
+    const queued = this.notifications.shift()
+    if (queued !== undefined) return Promise.resolve(queued)
+    if (this.failed) return Promise.reject(this.failed)
+    const notification = new Promise((resolveNotification, rejectNotification) => {
+      this.waiters.push({ resolve: resolveNotification, reject: rejectNotification })
+    })
+    return Promise.race([notification, deadlinePromise(deadline, 'TURN_TIMEOUT')])
+  }
+
+  fail(error) {
+    if (this.failed) return
+    this.failed = error instanceof SidecarError ? error : new SidecarError('SIDECAR_FAILURE')
+    for (const pending of this.pending.values()) pending.reject(this.failed)
+    this.pending.clear()
+    for (const waiter of this.waiters.splice(0)) waiter.reject(this.failed)
+    this.kill()
+  }
+
+  kill() {
+    if (this.child.exitCode !== null || this.child.signalCode !== null) return
+    this.child.stdin.destroy()
+    this.child.kill('SIGKILL')
+  }
+
+  async close(deadline) {
+    this.closing = true
+    if (!this.failed && this.child.exitCode === null && this.child.signalCode === null) {
+      try {
+        await this.request('shutdown', {}, Math.min(deadline, Date.now() + 1_000), 'CLEANUP_FAILED')
+      } catch {
+        this.kill()
+      }
+    }
+    this.child.stdin.end()
+    let result
+    try {
+      result = await Promise.race([this.closeTask, deadlinePromise(deadline, 'CLEANUP_FAILED')])
+    } catch (error) {
+      this.fail(error)
+      throw this.failed
+    }
+    if (this.stdoutBuffer.length !== 0 || this.pending.size !== 0
+      || this.waiters.length !== 0 || this.notifications.length !== 0) {
+      this.fail(new SidecarError('PROTOCOL_VIOLATION'))
+    }
+    if (result.code !== 0 || this.failed) {
+      if (this.failed) throw this.failed
+      throw new SidecarError('CLEANUP_FAILED')
+    }
+  }
+}
+
+function eventFrom(notification, sessionId) {
+  if (notification.method !== 'session.event') return undefined
+  const params = record(notification.params)
+  if (params.sessionId !== sessionId) throw new SidecarError('PROTOCOL_VIOLATION')
+  exactKeys(params, ['sessionId', 'event'], 'PROTOCOL_VIOLATION')
+  const event = record(params.event)
+  if (typeof event.type !== 'string') throw new SidecarError('PROTOCOL_VIOLATION')
+  if (event.type === 'tool/call' || event.type === 'tool/result') throw new SidecarError('TOOLS_EXPOSED')
+  if (!ALLOWED_EVENT_TYPES.has(event.type)) throw new SidecarError('UNKNOWN_EVENT')
+  return event
+}
+
+function matchingReceipt(event, messageId) {
+  return event?.type === 'agent/inbox/spliced'
     && Array.isArray(event.data?.inserted)
-    && event.data.inserted.some(message => message?.id !== messageId))
+    && event.data.inserted.some(message => message?.id === messageId)
+}
+
+function verifyEvents(events, messageId, payloadCanonical) {
+  const matchingReceipts = events.filter(event => matchingReceipt(event, messageId))
+  const userMessages = events.filter(event => event.type === 'user/message')
+  const assistants = events.filter(event => event.type === 'assistant/message')
   const turnStarts = events.filter(event => event.type === 'turn/start')
   const turnEnds = events.filter(event => event.type === 'turn/end')
-  const userMessages = events.filter(event => event.type === 'user/message' && event.data?.id === messageId)
-  const assistants = events.filter(event => event.type === 'assistant/message')
   const toolEvents = events.filter(event => event.type === 'tool/call' || event.type === 'tool/result')
-  const requestHeaders = events.filter(event => event.type === 'request/header')
-
-  if (matchingReceipts.length !== 1 || otherInsertions.length !== 0
-    || turnStarts.length !== 1 || turnEnds.length !== 1 || userMessages.length !== 1
-    || assistants.length !== 1 || toolEvents.length !== 0) {
-    throw new SidecarError('AMBIGUOUS_RESULT', 'event interval is not one isolated, tool-free turn')
+  const headers = events.filter(event => event.type === 'request/header')
+  if (matchingReceipts.length !== 1 || userMessages.length !== 1 || assistants.length !== 1
+    || turnStarts.length !== 1 || turnEnds.length !== 1 || toolEvents.length !== 0) {
+    throw new SidecarError(toolEvents.length > 0 ? 'TOOLS_EXPOSED' : 'AMBIGUOUS_RESULT')
   }
-  const turn = turnStarts[0].data?.turn
-  if (turnEnds[0].data?.turn !== turn || turnEnds[0].data?.reason?.kind !== 'completed') {
-    throw new SidecarError('TURN_REJECTED', 'turn did not end with completed')
+  if (turnEnds[0].data?.turn !== turnStarts[0].data?.turn || turnEnds[0].data?.reason?.kind !== 'completed') {
+    throw new SidecarError('AMBIGUOUS_RESULT')
   }
-  for (const header of requestHeaders) {
+  for (const header of headers) {
     const tools = header.data?.header?.tools
-    if (tools !== undefined && (!Array.isArray(tools) || tools.length !== 0)) {
-      throw new SidecarError('TOOLS_EXPOSED', 'request header exposed model-facing tools')
-    }
+    if (tools !== undefined && (!Array.isArray(tools) || tools.length !== 0)) throw new SidecarError('TOOLS_EXPOSED')
   }
-  const finalText = textOfAssistant(assistants[0])
-  if (finalText === undefined) throw new SidecarError('AMBIGUOUS_RESULT', 'no assistant result')
-  return { turn, finalText }
+  const userContent = userMessages[0].data?.content
+  if (!Array.isArray(userContent) || userContent.length !== 1
+    || userContent[0]?.type !== 'text' || userContent[0]?.text !== payloadCanonical) throw new SidecarError('AMBIGUOUS_RESULT')
+  const content = assistants[0].data?.message?.content
+  if (!Array.isArray(content) || !content.every(block => block?.type === 'text' && typeof block.text === 'string')) {
+    throw new SidecarError('AMBIGUOUS_RESULT')
+  }
+  return parseAdvice(content.map(block => block.text).join(''))
 }
 
-async function bindProjectRoot(root, projectRef, sidecarInstanceId) {
-  await mkdir(root, { recursive: true, mode: 0o700 })
-  const absolute = await realpath(root)
-  const markerPath = join(absolute, '.fde-project.json')
-  const marker = JSON.stringify({ schema: 'fde.sidecar-project.v1', projectRef, upstreamCommit: UPSTREAM_COMMIT }) + '\n'
-  try {
-    const handle = await open(markerPath, 'wx', 0o600)
-    try { await handle.writeFile(marker) } finally { await handle.close() }
-  } catch (error) {
-    if (error?.code !== 'EEXIST') throw error
-    let existing
-    try { existing = JSON.parse(await readFile(markerPath, 'utf8')) } catch (cause) {
-      throw new SidecarError('PROJECT_ROOT_INVALID', 'project root marker is unreadable', cause)
-    }
-    if (existing?.projectRef !== projectRef || existing?.upstreamCommit !== UPSTREAM_COMMIT) {
-      throw new SidecarError('PROJECT_ROOT_MISMATCH', 'session root belongs to another project or runtime commit')
+async function findSessionLog(sessionRoot) {
+  const { readdir } = await import('node:fs/promises')
+  const found = []
+  async function visit(directory) {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name)
+      if (entry.isDirectory()) await visit(path)
+      else if (entry.isFile() && entry.name === 'session.jsonl') found.push(path)
     }
   }
-  const lockPath = join(absolute, '.fde-sidecar.lock')
-  let lock
-  try {
-    lock = await open(lockPath, 'wx', 0o600)
-    await lock.writeFile(`${sidecarInstanceId}\n`)
-  } catch (error) {
-    if (error?.code === 'EEXIST') throw new SidecarError('PROJECT_ALREADY_ACTIVE', 'project already has an active sidecar')
-    throw error
-  }
-  return { root: absolute, lockPath, lock }
+  await visit(sessionRoot)
+  if (found.length !== 1) throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+  return found[0]
 }
 
-export class FdeAggregateSidecar {
+export function verifyDurableSession(logText, { sessionId, sessionRoot, expectedEvents }) {
+  let rows
+  try { rows = logText.trimEnd().split('\n').map(line => JSON.parse(line)) } catch {
+    throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+  }
+  if (rows.length < 2) throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+  const header = record(rows[0])
+  exactKeys(header, ['type', 'version', 'id', 'createdAt', 'cwd', 'delegationDepth'], 'PERSISTENCE_NOT_PROVEN')
+  if (header.type !== 'session' || header.version !== 0 || header.id !== sessionId
+    || header.cwd !== sessionRoot || header.delegationDepth !== 0
+    || !Number.isSafeInteger(header.createdAt) || header.createdAt < 0) {
+    throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+  }
+  const persisted = rows.slice(1)
+  for (let index = 0; index < persisted.length; index += 1) {
+    const event = record(persisted[index])
+    if (event.type === 'tool/call' || event.type === 'tool/result') throw new SidecarError('TOOLS_EXPOSED')
+    if (!ALLOWED_EVENT_TYPES.has(event.type)) throw new SidecarError('UNKNOWN_EVENT')
+    if (event.seq !== index) throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+  }
+  if (persisted.length !== expectedEvents.length) throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+  for (let index = 0; index < persisted.length; index += 1) {
+    if (canonicalJson(persisted[index]) !== canonicalJson(expectedEvents[index])) {
+      throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+    }
+  }
+  return persisted
+}
+
+async function ensurePrivateDirectory(path, create) {
+  if (create) await mkdir(path, { recursive: false, mode: 0o700 })
+  const info = await stat(path)
+  if (!info.isDirectory() || (info.mode & 0o077) !== 0) throw new SidecarError('SANDBOX_FAILURE')
+  return realpath(path)
+}
+
+async function proveSandboxActive() {
+  try {
+    await readFile('/private/etc/hosts')
+  } catch (error) {
+    if (error?.code === 'EPERM') return
+    throw new SidecarError('SANDBOX_FAILURE')
+  }
+  throw new SidecarError('SANDBOX_FAILURE')
+}
+
+export class FdeHarnessSidecar {
   constructor(options) {
-    this.projectRef = boundedToken(options.projectRef, /^PRJ-[A-Z0-9-]{1,48}$/, 'projectRef')
     this.sessionRoot = resolve(options.sessionRoot)
-    this.configPath = resolve(options.configPath ?? defaultConfig)
-    this.runtimePath = resolve(options.runtimePath ?? defaultRuntime)
-    this.profilePath = resolve(options.profilePath ?? defaultProfile)
-    this.replayFile = resolve(options.replayFile ?? defaultReplayFile)
-    this.replayOverride = resolve(options.replayOverride ?? defaultReplayOverride)
-    this.turnTimeoutMs = options.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS
-    this.sidecarInstanceId = `sidecar-${randomUUID()}`
-    this.sessionId = `fde-${this.projectRef.toLowerCase()}`
-    this.busy = false
-    this.closed = false
-    this.startTask = undefined
-    this.client = undefined
-    this.rootBinding = undefined
-    this.profileDigest = undefined
+    this.runRoot = resolve(options.runRoot ?? join(this.sessionRoot, '..', `run-${randomUUID()}`))
+    this.manifestPath = resolve(options.manifestPath ?? defaults.manifest)
+    this.clientFactory = options.clientFactory
+    this.precreatedRoots = options.precreatedRoots ?? false
   }
 
-  async start() {
-    if (this.closed) throw new SidecarError('SIDECAR_CLOSED', 'sidecar is closed')
-    this.startTask ??= this.startOnce()
-    return this.startTask
-  }
+  async analyze(rawRequest) {
+    if (process.platform !== 'darwin') throw new SidecarError('PLATFORM_UNSUPPORTED')
+    await proveSandboxActive()
+    const { outgoingDigest, payloadCanonical } = validateRequest(rawRequest)
+    const verified = await verifyRuntimeManifest({ manifestPath: this.manifestPath })
+    const sessionId = `fde-${randomUUID()}`
+    await ensurePrivateDirectory(this.runRoot, !this.precreatedRoots)
+    await ensurePrivateDirectory(this.sessionRoot, !this.precreatedRoots)
+    const runtimeTmp = join(this.runRoot, 'runtime-tmp')
+    await mkdir(runtimeTmp, { mode: 0o700 })
+    const bootstrapRoot = join(this.runRoot, 'bootstrap')
+    await mkdir(bootstrapRoot, { mode: 0o500 })
+    await chmod(bootstrapRoot, 0o500)
 
-  async startOnce() {
-    const canonicalLabRoot = await realpath(labRoot)
-    const canonicalConfig = await realpath(this.configPath)
-    const canonicalRuntime = await realpath(this.runtimePath)
-    const canonicalProfile = await realpath(this.profilePath)
-    const canonicalReplayFile = await realpath(this.replayFile)
-    const canonicalReplayOverride = await realpath(this.replayOverride)
-    for (const [label, path] of [
-      ['config', canonicalConfig], ['runtime', canonicalRuntime], ['profile', canonicalProfile],
-      ['replay fixture', canonicalReplayFile], ['replay override', canonicalReplayOverride],
-    ]) {
-      if (!path.startsWith(`${canonicalLabRoot}/`)) {
-        throw new SidecarError('RUNTIME_PATH_REJECTED', `${label} must remain inside the fixed lab checkout`)
-      }
-    }
-    this.configPath = canonicalConfig
-    this.runtimePath = canonicalRuntime
-    this.profilePath = canonicalProfile
-    this.replayFile = canonicalReplayFile
-    this.replayOverride = canonicalReplayOverride
-    this.rootBinding = await bindProjectRoot(this.sessionRoot, this.projectRef, this.sidecarInstanceId)
+    const createClient = this.clientFactory ?? (options => new BoundedJsonRpcClient(options))
+    const client = createClient({
+      nodePath: verified.nodePath,
+      runtimePath: verified.paths.runtimeArtifact,
+      configPath: verified.paths.config,
+      sessionRoot: await realpath(this.sessionRoot),
+      runtimeTmp: await realpath(runtimeTmp),
+      bootstrapRoot: await realpath(bootstrapRoot),
+      replayFile: verified.paths.replaySession,
+      replayOverride: verified.paths.replayOverride,
+    })
+    let events = []
+    let result
+    let failure
     try {
-      const [runtimeArtifact, adapterSource, ...profileMaterial] = await Promise.all([
-        readFile(this.runtimePath), readFile(fileURLToPath(import.meta.url)),
-        readFile(this.configPath), readFile(this.profilePath), readFile(this.replayFile), readFile(this.replayOverride),
-      ])
-      this.profileDigest = sha256(Buffer.concat(profileMaterial))
-      this.runtimeArtifactDigest = sha256(runtimeArtifact)
-      this.adapterDigest = sha256(adapterSource)
-      const env = {
-        PATH: process.env.PATH ?? '/usr/bin:/bin',
-        TMPDIR: process.env.TMPDIR ?? '/tmp',
-        FDE_SIDECAR_SESSION_ROOT: this.rootBinding.root,
-        FDE_SIDECAR_REPLAY_FILE: this.replayFile,
-        FDE_SIDECAR_REPLAY_OVERRIDE: this.replayOverride,
-        NODE_OPTIONS: '--disable-warning=ExperimentalWarning',
-      }
-      this.client = new HarnessClient({
-        command: '/usr/bin/sandbox-exec',
-        args: [
-          '-D', `SESSION_ROOT=${this.rootBinding.root}`,
-          '-f', this.profilePath,
-          process.execPath, this.runtimePath, this.configPath,
-        ],
-        cwd: this.rootBinding.root,
-        env,
-        requestTimeoutMs: this.turnTimeoutMs,
-        shutdownTimeoutMs: 1_000,
-        disposeEofGraceMs: 3_000,
-        disposeGraceMs: 2_000,
-      })
-      this.client.start()
-      const identity = await this.client.initialize({
-        cwd: this.rootBinding.root,
+      const initialize = await client.request('initialize', {
+        cwd: await realpath(this.sessionRoot),
         provider: 'fde-replay',
         model: 'aggregate-review-v1',
         maxTokens: 1024,
-      })
-      if (identity.serverInfo.name !== SERVER_NAME || identity.serverInfo.version !== SERVER_VERSION) {
-        throw new SidecarError('RUNTIME_IDENTITY_MISMATCH', `unexpected runtime identity: ${JSON.stringify(identity)}`)
+      }, Date.now() + INITIALIZE_TIMEOUT_MS, 'INITIALIZE_TIMEOUT')
+      if (initialize?.serverInfo?.name !== SERVER_NAME || initialize?.serverInfo?.version !== SERVER_VERSION) {
+        throw new SidecarError('PROTOCOL_VIOLATION')
       }
-      return identity
-    } catch (error) {
-      await this.close().catch(() => {})
-      throw error
-    }
-  }
-
-  async analyze(rawInput) {
-    const { input, canonical, reviewId, projectRef } = validateAggregateReview(rawInput, this.projectRef)
-    if (this.closed) throw new SidecarError('SIDECAR_CLOSED', 'sidecar is closed')
-    if (this.busy) throw new SidecarError('SESSION_BUSY', 'same-session concurrent work is rejected; retry after idle')
-    this.busy = true
-    try {
-      await this.start()
-      const client = this.client
-      if (client === undefined) throw new SidecarError('SIDECAR_NOT_STARTED', 'runtime client is unavailable')
-      const subscription = client.subscribe(notification => notification.params?.sessionId === this.sessionId)
-      try {
-        const messageId = await client.prompt(this.sessionId, [{ type: 'text', text: canonical }])
-        const events = []
-        let receiptSeen = false
-        let idleSeen = false
-        while (!idleSeen) {
-          const notification = await timeout(subscription.next(), this.turnTimeoutMs, 'turn notification interval')
-          const event = eventEnvelope(notification)
-          if (!receiptSeen) {
-            if (event === undefined || !isReceipt(event, messageId)) continue
-            receiptSeen = true
+      const turnDeadline = Date.now() + TURN_TIMEOUT_MS
+      const prompt = await client.request('session/prompt', {
+        sessionId,
+        contentBlocks: [{ type: 'text', text: payloadCanonical }],
+      }, turnDeadline, 'TURN_TIMEOUT')
+      if (typeof prompt?.messageId !== 'string' || prompt.messageId === '') throw new SidecarError('PROTOCOL_VIOLATION')
+      let idle = false
+      while (!idle) {
+        const notification = await client.nextNotification(turnDeadline)
+        if (notification.method === 'session.status') {
+          exactKeys(notification.params, ['sessionId', 'status'], 'PROTOCOL_VIOLATION')
+          if (notification.params.sessionId !== sessionId || !['running', 'idle'].includes(notification.params.status)) {
+            throw new SidecarError('PROTOCOL_VIOLATION')
           }
-          if (event !== undefined) events.push(event)
-          if (notification.method === 'session.status' && notification.params.status === 'idle') idleSeen = true
+          if (notification.params.status === 'idle') idle = true
+          continue
         }
-        if (!receiptSeen) throw new SidecarError('MISSING_RECEIPT', 'prompt has no matching durable inbox receipt')
-        const interval = verifyStrictInterval(events, messageId)
-        const suggestion = parseSuggestion(interval.finalText)
-        return {
-          schema: RECEIPT_SCHEMA,
-          reviewId,
-          projectRef,
-          sidecarInstanceId: this.sidecarInstanceId,
-          sessionId: this.sessionId,
-          messageId,
-          runtime: {
-            upstreamCommit: UPSTREAM_COMMIT,
-            serverName: SERVER_NAME,
-            serverVersion: SERVER_VERSION,
-            profileDigest: this.profileDigest,
-            runtimeArtifactDigest: this.runtimeArtifactDigest,
-            adapterDigest: this.adapterDigest,
-            processModel: 'one-project-one-runtime-process',
-            networkPolicy: 'deny-all',
-            writePolicy: 'session-root-only',
-          },
-          outcome: { turn: interval.turn, reason: 'completed', suggestion },
-          evidence: {
-            inputDigest: sha256(canonical),
-            eventDigest: sha256(events.map(event => JSON.stringify(event)).join('\n')),
-            eventTypes: events.map(event => event.type),
-            toolCallCount: 0,
-          },
-          authority: 'advisory-only',
-        }
-      } catch (error) {
-        if (error instanceof SidecarError && ['TURN_TIMEOUT', 'AMBIGUOUS_RESULT'].includes(error.code)) {
-          await this.close().catch(() => {})
-        }
-        throw error
-      } finally {
-        subscription.close()
+        const event = eventFrom(notification, sessionId)
+        if (event !== undefined) events.push(event)
       }
-    } finally {
-      this.busy = false
+      const suggestion = verifyEvents(events, prompt.messageId, payloadCanonical)
+      result = { suggestion }
+    } catch (error) {
+      failure = error instanceof SidecarError ? error : new SidecarError('SIDECAR_FAILURE')
+      client.fail?.(failure)
     }
-  }
 
-  async close() {
-    if (this.closed) return
-    this.closed = true
-    const failures = []
-    try { await this.client?.close() } catch (error) { failures.push(error) }
-    if (this.rootBinding !== undefined) {
-      try { await this.rootBinding.lock.close() } catch (error) { failures.push(error) }
-      try { await unlink(this.rootBinding.lockPath) } catch (error) {
-        if (error?.code !== 'ENOENT') failures.push(error)
-      }
+    try {
+      await client.close(Date.now() + CLEANUP_TIMEOUT_MS)
+    } catch (error) {
+      failure ??= error instanceof SidecarError ? error : new SidecarError('CLEANUP_FAILED')
     }
-    if (failures.length === 1) throw failures[0]
-    if (failures.length > 1) throw new AggregateError(failures, 'sidecar close failed')
+    if (failure) throw failure
+
+    const sessionLog = await findSessionLog(this.sessionRoot)
+    const logBytes = await readFile(sessionLog)
+    const logText = logBytes.toString('utf8')
+    if (logText.includes(REQUEST_KIND) || logText.includes(outgoingDigest)) {
+      throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+    }
+    const persisted = verifyDurableSession(logText, {
+      sessionId,
+      sessionRoot: await realpath(this.sessionRoot),
+      expectedEvents: events,
+    })
+    if (persisted.length === 0 || persisted[persisted.length - 1]?.type !== 'turn/end'
+      || persisted[persisted.length - 1]?.data?.reason?.kind !== 'completed') {
+      throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+    }
+    const manifest = verified.manifest
+    return {
+      schemaVersion: 1,
+      kind: RECEIPT_KIND,
+      outgoingDigest,
+      runtime: {
+        upstreamCommit: UPSTREAM_COMMIT,
+        manifestDigest: `sha256:${verified.manifestDigest}`,
+        adapterProfileDigest: `sha256:${manifest.adapterProfile.sha256}`,
+        runtimeArtifactDigest: `sha256:${manifest.runtimeArtifact.sha256}`,
+        sidecarDigest: `sha256:${manifest.sidecar.sha256}`,
+        providerMode: 'KEYLESS_REPLAY',
+        modelInferenceExecuted: false,
+        cloudProviderConfigured: false,
+        networkPolicy: 'DENY_ALL_ENFORCED',
+        toolsExposed: 0,
+        fdeMutationExecuted: false,
+        sessionPersistenceExecuted: true,
+      },
+      outcome: { status: 'COMPLETED', suggestion: result.suggestion },
+      evidence: {
+        inputDigest: outgoingDigest,
+        eventDigest: sha256(persisted.map(event => canonicalJson(event)).join('\n')),
+        eventCount: persisted.length,
+        toolCallCount: 0,
+      },
+      authority: 'ADVISORY_ONLY',
+    }
   }
 }
 
-function cliArgs(argv) {
-  const args = new Map()
-  for (let i = 0; i < argv.length; i += 2) args.set(argv[i], argv[i + 1])
-  const projectRef = args.get('--project-ref')
-  const sessionRoot = args.get('--session-root')
-  if (projectRef === undefined || sessionRoot === undefined) {
-    throw new SidecarError('CLI_USAGE', 'usage: sidecar.mjs --project-ref PRJ-TOKEN --session-root /absolute/private/root')
+function parseCliArgs(argv) {
+  if (argv.length !== 2 || argv[0] !== '--session-root' || typeof argv[1] !== 'string') {
+    throw new SidecarError('INVALID_REQUEST')
   }
-  return { projectRef, sessionRoot }
+  const sessionRoot = resolve(argv[1])
+  return { sessionRoot, runRoot: join(dirname(sessionRoot), `run-${randomUUID()}`) }
+}
+
+function parseInternalCliArgs(argv) {
+  if (argv.length !== 6 || argv[0] !== '--internal-session-root' || argv[2] !== '--internal-run-root'
+    || argv[4] !== '--manifest') throw new SidecarError('INVALID_REQUEST')
+  return { sessionRoot: resolve(argv[1]), runRoot: resolve(argv[3]), manifestPath: resolve(argv[5]) }
+}
+
+async function verifyInternalLaunchProof(args, nonce) {
+  if (!/^[0-9a-f]{64}$/.test(nonce ?? '')) throw new SidecarError('SANDBOX_FAILURE')
+  const verified = await verifyRuntimeManifest({ manifestPath: args.manifestPath })
+  if (await realpath(args.manifestPath) !== await realpath(defaults.manifest)) {
+    throw new SidecarError('SANDBOX_FAILURE')
+  }
+  const proofPath = join(args.runRoot, 'launcher.proof')
+  let proof
+  try { proof = JSON.parse(await readFile(proofPath, 'utf8')) } catch { throw new SidecarError('SANDBOX_FAILURE') }
+  const value = record(proof)
+  exactKeys(value, ['schemaVersion', 'kind', 'nonceDigest', 'sessionRoot', 'runRoot', 'manifestDigest'], 'SANDBOX_FAILURE')
+  if (value.schemaVersion !== 1 || value.kind !== 'effiengine.fde-harness-launch-proof'
+    || value.nonceDigest !== sha256(nonce)
+    || value.sessionRoot !== await realpath(args.sessionRoot)
+    || value.runRoot !== await realpath(args.runRoot)
+    || value.manifestDigest !== `sha256:${verified.manifestDigest}`) {
+    throw new SidecarError('SANDBOX_FAILURE')
+  }
+  try { await unlink(proofPath) } catch { throw new SidecarError('SANDBOX_FAILURE') }
+}
+
+async function launchSandboxedAdapter({ sessionRoot, runRoot }) {
+  if (process.platform !== 'darwin') throw new SidecarError('PLATFORM_UNSUPPORTED')
+  const verified = await verifyRuntimeManifest()
+  await ensurePrivateDirectory(runRoot, true)
+  await ensurePrivateDirectory(sessionRoot, true)
+  const profileTemplate = await readFile(verified.paths.adapterProfile, 'utf8')
+  const profile = replaceProfileParameters(profileTemplate, {
+    NODE_PATH: verified.nodePath,
+    LAB_ROOT: await realpath(labRoot),
+    PRIVATE_PARENT: await realpath(dirname(runRoot)),
+    RUN_ROOT: await realpath(runRoot),
+    SESSION_ROOT: await realpath(sessionRoot),
+  })
+  const profilePath = join(runRoot, 'adapter.generated.sb')
+  await writePrivateFile(profilePath, profile)
+  const nonce = randomBytes(32).toString('hex')
+  const proof = {
+    schemaVersion: 1,
+    kind: 'effiengine.fde-harness-launch-proof',
+    nonceDigest: sha256(nonce),
+    sessionRoot: await realpath(sessionRoot),
+    runRoot: await realpath(runRoot),
+    manifestDigest: `sha256:${verified.manifestDigest}`,
+  }
+  await writePrivateFile(join(runRoot, 'launcher.proof'), `${canonicalJson(proof)}\n`)
+  const env = {
+    PATH: '/usr/bin:/bin',
+    TMPDIR: runRoot,
+    FDE_ADAPTER_SANDBOXED: '1',
+    FDE_ADAPTER_LAUNCH_NONCE: nonce,
+    NODE_OPTIONS: '--disable-warning=ExperimentalWarning',
+  }
+  const child = spawn('/usr/bin/sandbox-exec', [
+    '-f', profilePath,
+    verified.nodePath, verified.paths.sidecar,
+    '--internal-session-root', await realpath(sessionRoot),
+    '--internal-run-root', await realpath(runRoot),
+    '--manifest', await realpath(defaults.manifest),
+  ], { cwd: runRoot, env, stdio: ['inherit', 'pipe', 'ignore'] })
+  const chunks = []
+  let total = 0
+  let overflow = false
+  child.stdout.on('data', chunk => {
+    total += chunk.length
+    if (total > MAX_FRAME_BYTES + 1) {
+      overflow = true
+      child.kill('SIGKILL')
+      return
+    }
+    chunks.push(chunk)
+  })
+  const result = await new Promise(resolveClose => {
+    child.once('error', () => resolveClose({ code: null, signal: null }))
+    child.once('close', (code, signal) => resolveClose({ code, signal }))
+  })
+  const output = Buffer.concat(chunks)
+  if (overflow || result.signal !== null || ![0, 2].includes(result.code)
+    || output.length === 0 || output.indexOf(0x0a) !== output.length - 1
+    || output.subarray(0, output.length - 1).includes(0x0a)) throw new SidecarError('SANDBOX_FAILURE')
+  process.stdout.write(output)
+  process.exitCode = result.code
+}
+
+async function readSingleInputLine() {
+  const chunks = []
+  let total = 0
+  for await (const chunk of process.stdin) {
+    total += chunk.length
+    if (total > MAX_INPUT_LINE_BYTES + 1) throw new SidecarError('INPUT_TOO_LARGE')
+    chunks.push(chunk)
+  }
+  const bytes = Buffer.concat(chunks)
+  const newline = bytes.indexOf(0x0a)
+  if (newline < 0 || newline !== bytes.length - 1 || bytes.subarray(0, newline).includes(0x0a)) {
+    throw new SidecarError(newline >= 0 ? 'MULTIPLE_REQUESTS' : 'INVALID_REQUEST')
+  }
+  const line = bytes.subarray(0, newline)
+  if (line.length === 0 || line.length > MAX_INPUT_LINE_BYTES || line.includes(0x0d)) throw new SidecarError('INVALID_REQUEST')
+  try { return JSON.parse(line.toString('utf8')) } catch { throw new SidecarError('INVALID_REQUEST') }
+}
+
+export function errorReceipt(error) {
+  const code = error instanceof SidecarError && ERROR_CODES.has(error.code) ? error.code : 'SIDECAR_FAILURE'
+  return { schemaVersion: 1, kind: ERROR_KIND, error: { code } }
 }
 
 async function main() {
-  const sidecar = new FdeAggregateSidecar(cliArgs(process.argv.slice(2)))
-  const lines = createInterface({ input: process.stdin, crlfDelay: Infinity })
   try {
-    for await (const line of lines) {
-      if (line.trim() === '') continue
-      try {
-        const receipt = await sidecar.analyze(JSON.parse(line))
-        process.stdout.write(`${JSON.stringify({ ok: true, receipt })}\n`)
-      } catch (error) {
-        const code = error instanceof SidecarError ? error.code : 'SIDECAR_FAILURE'
-        process.stdout.write(`${JSON.stringify({ ok: false, error: { code, message: String(error?.message ?? error) } })}\n`)
-        process.exitCode = 2
-        break
-      }
+    const internalArgs = process.argv[2] === '--internal-session-root'
+    if (internalArgs) {
+      if (process.env.FDE_ADAPTER_SANDBOXED !== '1') throw new SidecarError('SANDBOX_FAILURE')
+      const args = parseInternalCliArgs(process.argv.slice(2))
+      await verifyInternalLaunchProof(args, process.env.FDE_ADAPTER_LAUNCH_NONCE)
+      await proveSandboxActive()
+      const request = await readSingleInputLine()
+      const receipt = await new FdeHarnessSidecar({ ...args, precreatedRoots: true }).analyze(request)
+      process.stdout.write(`${canonicalJson(receipt)}\n`)
+    } else {
+      if (process.env.FDE_ADAPTER_SANDBOXED !== undefined
+        || process.env.FDE_ADAPTER_LAUNCH_NONCE !== undefined) throw new SidecarError('SANDBOX_FAILURE')
+      await launchSandboxedAdapter(parseCliArgs(process.argv.slice(2)))
     }
-  } finally {
-    await sidecar.close()
+  } catch (error) {
+    process.stdout.write(`${canonicalJson(errorReceipt(error))}\n`)
+    process.exitCode = 2
   }
 }
 
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  await main()
-}
+if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) await main()

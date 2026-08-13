@@ -1,0 +1,32 @@
+(version 1)
+(deny default)
+
+; macOS refuses nested sandbox_init, so this one profile contains the adapter
+; and its runtime child. Only the pinned Node binary may be exec'd; that grant
+; is inherited by the runtime and stays inside this same deny-default policy.
+(allow process-exec (literal "@@NODE_PATH@@"))
+(allow process-fork)
+(allow signal (target children))
+(allow process-info-pidinfo (target children))
+
+; Node bootstrap plus the fixed lab checkout are read-only.
+(allow file-read* (literal "/") (literal "/dev/null"))
+(allow file-read* (subpath "/System") (subpath "/usr/lib") (subpath "/usr/share"))
+(allow file-read* (subpath "@@LAB_ROOT@@"))
+(allow file-read* (literal "@@NODE_PATH@@") (literal "/private/etc/passwd"))
+(allow file-read-metadata)
+(allow sysctl-read
+  (sysctl-name "kern.ostype")
+  (sysctl-name "kern.hostname")
+  (sysctl-name "kern.osrelease")
+  (sysctl-name "kern.version")
+  (sysctl-name "hw.machine"))
+
+; The adapter writes only its private launcher directory and its private Session root.
+(allow file-read*
+  (literal "@@PRIVATE_PARENT@@")
+  (literal "@@RUN_ROOT@@") (subpath "@@RUN_ROOT@@")
+  (literal "@@SESSION_ROOT@@") (subpath "@@SESSION_ROOT@@"))
+(allow file-write*
+  (literal "@@RUN_ROOT@@") (subpath "@@RUN_ROOT@@")
+  (literal "@@SESSION_ROOT@@") (subpath "@@SESSION_ROOT@@"))
