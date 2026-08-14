@@ -10,7 +10,9 @@ FDE needs a keyless experiment that proves the official DeepSeek Harness runtime
 
 ## Decision
 
-`fde-sidecar/` ships a macOS-only, one-shot replay experiment pinned to upstream commit `47f943859bef60e4160492346772ded9b24f765a`. Stdin accepts one exact request wrapper containing only `outgoingDigest` and the closed `effiengine.fde-harness-aggregate-facts` payload. The digest covers recursively key-sorted canonical payload bytes, and only those payload bytes enter the Harness prompt.
+`fde-sidecar/` ships a macOS-only, one-shot replay experiment pinned to upstream commit `47f943859bef60e4160492346772ded9b24f765a`. Stdin accepts one exact schema-v1 request wrapper containing only `outgoingDigest` and the closed `effiengine.fde-harness-aggregate-facts` payload. The payload may be the exact existing `fde.aggregate-facts.v1` profile or the exact P2-L1 `fde.aggregate-facts.v2` profile. The digest covers recursively key-sorted canonical payload bytes, and only those payload bytes enter the Harness prompt.
+
+V2 preserves the aggregate `plan`, `counts`, `acceptance`, `findings`, and `evidence` facts and adds only `contentPrivacy`: fixed scalar enums followed by nine fixed, ordered `{code,countBucket}` pairs. Counts use the closed coarse buckets `ZERO`, `ONE`, `TWO_TO_FIVE`, and `SIX_PLUS`, never exact counts; `PRIVATE_KEY_MATERIAL` and `CREDENTIAL_ASSIGNMENT` must be `ZERO` because the FDE local gate blocks them before outbound creation. V2 semantics fixes the two evidence classes and states that raw text, redacted text, and token maps are absent. Exact-key validation at every layer leaves no schema position for source or masked text, preview segments, offsets, token values or maps, source or review digests, or a free-form prompt. The sidecar is an admission gate, not a sanitizer: it refuses an unsafe shape instead of transforming it.
 
 Every public invocation creates a fresh private run root, a fresh persisted Session, and one official stdio JSON-RPC runtime. The local bounded client limits input, frames, aggregate output, stderr, assistant text, initialization, turn time, and cleanup; summary and action text are capped at 500 and 300 Unicode code points respectively. It rejects unknown notifications or events, tool activity, duplicate responses, multiple assistant results, trailing partial frames, and any result that cannot be associated with the single Session and message.
 
@@ -22,7 +24,7 @@ Completion requires official `shutdown`, process close with stdio EOF, an empty 
 
 ## Verification
 
-The dedicated sidecar suite exercises the public CLI with the official replay runtime, validates identical-input Session separation and payload-only persistence, proves host read/write/network and unpinned-exec denial, and rejects an externally injected internal marker. Counterexamples change the generated profile after proof creation and one transitive carrier JS file, with the latter failing the public CLI before Session creation. A fresh carrier rebuild must reproduce the canonical closure. Durable-only tool and assistant events, an unknown trailing notification, a duplicate response, or a partial final frame remain failures even after a valid response. This suite is an experiment-specific check and is not part of the repository default CI inventory.
+The dedicated sidecar suite exercises both v1 and v2 through the public CLI with the official replay runtime, validates canonical request admission, identical-input Session separation, and payload-only persistence, proves host read/write/network and unpinned-exec denial, and rejects an externally injected internal marker. V2 counterexamples reject original or masked text, token maps and values, free prompts, preview segments, offsets, source digests, unknown fields, reordered or missing privacy findings, invalid buckets, and non-zero hard-block buckets before Session creation. Additional counterexamples change the generated profile after proof creation and one transitive carrier JS file, with the latter failing the public CLI before Session creation. A fresh carrier rebuild must reproduce the canonical closure. Durable-only tool and assistant events, an unknown trailing notification, a duplicate response, or a partial final frame remain failures even after a valid response. This suite is an experiment-specific check and is not part of the repository default CI inventory.
 
 ## Alternatives considered
 
@@ -34,10 +36,20 @@ The dedicated sidecar suite exercises the public CLI with the official replay ru
 
 **Trust an internal environment marker.** Rejected because a public caller can pre-populate inherited environment. The internal path requires a launcher-created one-use proof and a real denial check in addition to the marker.
 
+**Make v2 fields optional or extensible.** Rejected because absence would be ambiguous and an expanding object would create a future text-smuggling seam.
+
+**Represent privacy findings as a map.** Rejected because fixed array order is part of the cross-repository canonical-byte contract and makes missing or duplicate findings explicit failures.
+
+**Send exact finding counts.** Rejected because the model needs only coarse exposure buckets, while exact counts add avoidable disclosure.
+
+**Carry redacted text or reversible tokens.** Rejected because masked text still contains customer content, and token restoration belongs exclusively to a local privacy gateway.
+
 **Send detailed business data to a cloud model in this experiment.** Rejected because keyless aggregate replay is intended to verify composition and containment, not DLP, re-identification resistance, cloud-model quality, or production privacy policy.
 
 ## Consequences
 
 The experiment reaches the official plugin-composed runtime and durable Session path while keeping the receipt's authority narrow and its enforcement claims honest. It costs one process tree and one Session per request, supports only the tested macOS Seatbelt boundary, and allows the contained runtime to re-exec only the pinned Node binary under the same restrictions. The generated carrier is a local experiment input, not a customer distribution artifact; third-party license review, artifact signing, and distribution packaging remain separate release checks.
+
+Supporting v2 does not widen runtime authority or capability, but the fixed order, enums, and canonical bytes create a coordinated FDE-to-Harness versioning obligation. Coarse buckets reduce disclosure at the cost of diagnostic detail. The sidecar still performs no DLP: unsafe content must be blocked by the local privacy gateway and rejected again by exact admission.
 
 This decision does not deliver cloud inference, a privacy gateway, token restoration, multi-user authorization, Linux or container confinement, FDE integration or deployment, browser acceptance, Tencent deployment, production retention policy, or model-quality evidence. Any of those capabilities requires its own implementation and release evidence.

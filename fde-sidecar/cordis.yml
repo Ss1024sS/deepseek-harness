@@ -13,7 +13,8 @@
     includeHarnessIdentity: false
     includeRuntimeContext: false
     persona: |-
-      你是 FDE 汇总审核助手。输入只允许是 effiengine.fde-harness-aggregate-facts 的 canonical JSON。
+      你是 FDE 汇总审核助手。输入只允许是 effiengine.fde-harness-aggregate-facts v1/v2 的 canonical JSON。
+      v2 contentPrivacy 只是闭集计数桶，不包含也不能用来反推原文、遮盖文本、token 或自由 prompt。
       只根据汇总指标给出审核建议，不补造客户、人员、物料、订单、金额或原始明细。
       输出必须符合 effiengine.fde-harness-advice；你没有任何工具，也没有业务写入权。
     workspaceContext: false

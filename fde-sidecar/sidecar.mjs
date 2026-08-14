@@ -67,6 +67,23 @@ const EVIDENCE_KEYS = [
   'configurationSlotsByStatus', 'configurationSlotsBySource', 'gapsByStatus',
   'syncRuntimeHealthByStatus', 'syncFreshnessByStatus',
 ]
+const CONTENT_PRIVACY_FINDING_CODES = [
+  'PRIVATE_KEY_MATERIAL',
+  'CREDENTIAL_ASSIGNMENT',
+  'PRC_ID_NUMBER',
+  'BANK_CARD_NUMBER',
+  'EMAIL_ADDRESS',
+  'PRC_MOBILE_NUMBER',
+  'URL',
+  'IP_ADDRESS',
+  'UNCLASSIFIED_TEXT',
+]
+const CONTENT_PRIVACY_COUNT_BUCKETS = new Set([
+  'ZERO', 'ONE', 'TWO_TO_FIVE', 'SIX_PLUS',
+])
+const CONTENT_PRIVACY_HARD_BLOCK_CODES = new Set([
+  'PRIVATE_KEY_MATERIAL', 'CREDENTIAL_ASSIGNMENT',
+])
 const ALLOWED_EVENT_TYPES = new Set([
   'agent/inbox/spliced', 'turn/start', 'step/start', 'user/message',
   'session/title', 'request/header', 'request/context', 'assistant/chunk',
@@ -154,26 +171,75 @@ function sha256Hex(value) {
   return createHash('sha256').update(value).digest('hex')
 }
 
+function validateContentPrivacy(value) {
+  const contentPrivacy = record(value)
+  exactKeys(contentPrivacy, [
+    'sourceKind', 'policy', 'decision', 'residualText', 'findings',
+  ])
+  if (contentPrivacy.sourceKind !== 'PASTED_PLAIN_TEXT'
+    || contentPrivacy.policy !== 'fde.local-content.v1'
+    || contentPrivacy.decision !== 'AGGREGATE_ONLY'
+    || contentPrivacy.residualText !== 'EXCLUDED_UNCLASSIFIED'
+    || !Array.isArray(contentPrivacy.findings)
+    || contentPrivacy.findings.length !== CONTENT_PRIVACY_FINDING_CODES.length) {
+    throw new SidecarError('INVALID_REQUEST')
+  }
+  for (let index = 0; index < CONTENT_PRIVACY_FINDING_CODES.length; index += 1) {
+    const finding = record(contentPrivacy.findings[index])
+    exactKeys(finding, ['code', 'countBucket'])
+    const expectedCode = CONTENT_PRIVACY_FINDING_CODES[index]
+    if (finding.code !== expectedCode
+      || !CONTENT_PRIVACY_COUNT_BUCKETS.has(finding.countBucket)
+      || CONTENT_PRIVACY_HARD_BLOCK_CODES.has(expectedCode) && finding.countBucket !== 'ZERO') {
+      throw new SidecarError('INVALID_REQUEST')
+    }
+  }
+}
+
 function validatePayload(value) {
   const payload = record(value)
   exactKeys(payload, ['schemaVersion', 'kind', 'profile', 'semantics', 'facts'])
-  if (payload.schemaVersion !== 1 || payload.kind !== PAYLOAD_KIND || payload.profile !== 'fde.aggregate-facts.v1') {
+  if (payload.kind !== PAYLOAD_KIND || ![1, 2].includes(payload.schemaVersion)) {
     throw new SidecarError('INVALID_REQUEST')
   }
   const semantics = record(payload.semantics)
-  exactKeys(semantics, [
-    'authority', 'evidenceClass', 'assemblyExecuted', 'deploymentExecuted',
-    'runtimeProbeExecuted', 'businessAcceptanceProven',
-  ])
-  if (semantics.authority !== 'ADVISORY_ONLY'
-    || semantics.evidenceClass !== 'STATIC_COMPILER_PROJECTION'
-    || semantics.assemblyExecuted !== false
-    || semantics.deploymentExecuted !== false
-    || semantics.runtimeProbeExecuted !== false
-    || semantics.businessAcceptanceProven !== false) throw new SidecarError('INVALID_REQUEST')
+  if (payload.schemaVersion === 1) {
+    if (payload.profile !== 'fde.aggregate-facts.v1') throw new SidecarError('INVALID_REQUEST')
+    exactKeys(semantics, [
+      'authority', 'evidenceClass', 'assemblyExecuted', 'deploymentExecuted',
+      'runtimeProbeExecuted', 'businessAcceptanceProven',
+    ])
+    if (semantics.authority !== 'ADVISORY_ONLY'
+      || semantics.evidenceClass !== 'STATIC_COMPILER_PROJECTION'
+      || semantics.assemblyExecuted !== false
+      || semantics.deploymentExecuted !== false
+      || semantics.runtimeProbeExecuted !== false
+      || semantics.businessAcceptanceProven !== false) throw new SidecarError('INVALID_REQUEST')
+  } else {
+    if (payload.profile !== 'fde.aggregate-facts.v2') throw new SidecarError('INVALID_REQUEST')
+    exactKeys(semantics, [
+      'authority', 'evidenceClasses', 'rawTextIncluded', 'redactedTextIncluded',
+      'tokenMapIncluded', 'assemblyExecuted', 'deploymentExecuted',
+      'runtimeProbeExecuted', 'businessAcceptanceProven',
+    ])
+    if (semantics.authority !== 'ADVISORY_ONLY'
+      || !Array.isArray(semantics.evidenceClasses)
+      || semantics.evidenceClasses.length !== 2
+      || semantics.evidenceClasses[0] !== 'STATIC_COMPILER_PROJECTION'
+      || semantics.evidenceClasses[1] !== 'DETERMINISTIC_LOCAL_CLASSIFICATION'
+      || semantics.rawTextIncluded !== false
+      || semantics.redactedTextIncluded !== false
+      || semantics.tokenMapIncluded !== false
+      || semantics.assemblyExecuted !== false
+      || semantics.deploymentExecuted !== false
+      || semantics.runtimeProbeExecuted !== false
+      || semantics.businessAcceptanceProven !== false) throw new SidecarError('INVALID_REQUEST')
+  }
 
   const facts = record(payload.facts)
-  exactKeys(facts, ['plan', 'counts', 'acceptance', 'findings', 'evidence'])
+  exactKeys(facts, payload.schemaVersion === 1
+    ? ['plan', 'counts', 'acceptance', 'findings', 'evidence']
+    : ['plan', 'counts', 'acceptance', 'findings', 'evidence', 'contentPrivacy'])
   const plan = record(facts.plan)
   exactKeys(plan, ['status', 'canAssemble', 'lockWouldWrite'])
   if (!['READY', 'BLOCKED'].includes(plan.status)) throw new SidecarError('INVALID_REQUEST')
@@ -197,6 +263,7 @@ function validatePayload(value) {
   const evidence = record(facts.evidence)
   exactKeys(evidence, EVIDENCE_KEYS)
   for (const key of EVIDENCE_KEYS) validateStatusCounts(evidence[key])
+  if (payload.schemaVersion === 2) validateContentPrivacy(facts.contentPrivacy)
   return payload
 }
 
