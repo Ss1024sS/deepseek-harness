@@ -2,5 +2,5 @@
 # side as of the last confirmed-consistent state. Both languages carry equal authority;
 # after editing either side, bring the other along and re-record with:
 #   pnpm run verify-translation-pairing --write .agents/notes/implemented/architecture/2026-08-14-fde-aggregate-only-replay-sidecar.md
-2026-08-14-fde-aggregate-only-replay-sidecar.md: b16b48341580b374bcc4087512b2cb9292b9eabd
-2026-08-14-fde-aggregate-only-replay-sidecar.zh.md: adf7a79a91653488d54cda146b538713c0c338bc
+2026-08-14-fde-aggregate-only-replay-sidecar.md: 9fdc1561c0d7e33c1eef09eba623f2f3bc544ca1
+2026-08-14-fde-aggregate-only-replay-sidecar.zh.md: 49f4633f4db19c228f7c32c150363a8606dda4c2

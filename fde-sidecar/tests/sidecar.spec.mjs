@@ -1,8 +1,8 @@
 import { execFile } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readFile, readdir, realpath, rm } from 'node:fs/promises'
+import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import { execa } from 'execa'
@@ -14,6 +14,7 @@ import {
   parseAdvice,
   validateRequest,
   verifyDurableSession,
+  verifyInternalLaunchProof,
   verifyRuntimeManifest,
 } from '../sidecar.mjs'
 
@@ -71,6 +72,10 @@ describe('hardened FDE one-shot Harness sidecar', () => {
     expect(verified.manifestDigest).toBe(createHash('sha256').update(raw).digest('hex'))
     expect(await realpath(verified.nodePath)).toBe(await realpath(process.execPath))
     expect(await realpath(resolve(sidecarRoot, verified.manifest.node.path))).toBe(verified.nodePath)
+    expect(verified.paths.runtimeArtifact).toBe(await realpath(join(
+      verified.paths.runtimeClosureRoot, verified.runtimeClosure.entry,
+    )))
+    expect(verified.runtimeClosure.files.length).toBeGreaterThan(1)
   })
 
   it('runs a real keyless replay, shuts down, then proves durable payload-only events', async () => {
@@ -99,13 +104,28 @@ describe('hardened FDE one-shot Harness sidecar', () => {
       outcome: { status: 'COMPLETED' },
       evidence: { inputDigest: input.outgoingDigest, toolCallCount: 0 },
     })
+    expect(Object.keys(receipt.runtime).sort()).toEqual([
+      'adapterTemplateDigest', 'cloudProviderConfigured', 'effectiveProfileDigest',
+      'fdeMutationExecuted', 'manifestDigest', 'modelInferenceExecuted', 'networkPolicy',
+      'providerMode', 'runtimeArtifactDigest', 'runtimeClosureDigest', 'sessionPersistenceExecuted',
+      'sidecarDigest', 'toolsExposed', 'upstreamCommit',
+    ])
     for (const key of [
-      'manifestDigest', 'adapterProfileDigest', 'runtimeArtifactDigest', 'sidecarDigest',
+      'manifestDigest', 'adapterTemplateDigest', 'effectiveProfileDigest',
+      'runtimeArtifactDigest', 'runtimeClosureDigest', 'sidecarDigest',
     ]) {
       expect(receipt.runtime[key]).toMatch(/^sha256:[0-9a-f]{64}$/)
     }
     const manifest = (await verifyRuntimeManifest()).manifest
-    expect(receipt.runtime.adapterProfileDigest).toBe(`sha256:${manifest.adapterProfile.sha256}`)
+    expect(receipt.runtime.adapterTemplateDigest).toBe(`sha256:${manifest.adapterProfile.sha256}`)
+    expect(receipt.runtime.runtimeClosureDigest).toBe(`sha256:${manifest.runtimeClosure.sha256}`)
+    const runDirectory = (await readdir(parent, { withFileTypes: true }))
+      .find(entry => entry.isDirectory() && entry.name.startsWith('run-'))
+    expect(runDirectory).toBeDefined()
+    const effectiveProfile = await readFile(join(parent, runDirectory.name, 'adapter.generated.sb'))
+    expect(receipt.runtime.effectiveProfileDigest)
+      .toBe(`sha256:${createHash('sha256').update(effectiveProfile).digest('hex')}`)
+    expect(receipt.runtime).not.toHaveProperty('adapterProfileDigest')
     expect(receipt.runtime).not.toHaveProperty('profileDigest')
     expect(receipt.runtime).not.toHaveProperty('runtimeProfileDigest')
     const files = (await readdir(sessionRoot, { recursive: true })).filter(path => path.endsWith('session.jsonl'))
@@ -137,6 +157,58 @@ describe('hardened FDE one-shot Harness sidecar', () => {
     expect((await readHeader(first)).id).not.toBe((await readHeader(second)).id)
   })
 
+  it('rejects an effective adapter profile changed after the launch proof was written', async () => {
+    const runRoot = await tempRoot('profile-proof')
+    const sessionRoot = join(runRoot, 'session')
+    await mkdir(sessionRoot, { mode: 0o700 })
+    const nonce = 'a'.repeat(64)
+    const verified = await verifyRuntimeManifest()
+    const original = '(version 1)\n'
+    const effectiveProfileDigest = `sha256:${createHash('sha256').update(original).digest('hex')}`
+    await writeFile(join(runRoot, 'adapter.generated.sb'), original, { mode: 0o600 })
+    await writeFile(join(runRoot, 'launcher.proof'), `${canonicalJson({
+      schemaVersion: 1,
+      kind: 'effiengine.fde-harness-launch-proof',
+      nonceDigest: `sha256:${createHash('sha256').update(nonce).digest('hex')}`,
+      sessionRoot: await realpath(sessionRoot),
+      runRoot: await realpath(runRoot),
+      manifestDigest: `sha256:${verified.manifestDigest}`,
+      adapterTemplateDigest: `sha256:${verified.manifest.adapterProfile.sha256}`,
+      effectiveProfileDigest,
+    })}\n`, { mode: 0o600 })
+    await writeFile(join(runRoot, 'adapter.generated.sb'), '(version 1)\n(allow default)\n')
+    await expect(verifyInternalLaunchProof({
+      sessionRoot,
+      runRoot,
+      manifestPath: join(sidecarRoot, 'runtime-manifest.json'),
+    }, nonce)).rejects.toMatchObject({ code: 'SANDBOX_FAILURE' })
+  })
+
+  it('fails the public CLI before Session creation when one transitive carrier JS file is changed', async () => {
+    const copyRoot = await mkdtemp(join(fileURLToPath(new URL('../../', import.meta.url)), '.fde-lab-copy-'))
+    roots.push(copyRoot)
+    const sidecarCopy = join(copyRoot, 'fde-sidecar')
+    await cp(sidecarRoot, sidecarCopy, { recursive: true })
+    const manifestPath = join(sidecarCopy, 'runtime-manifest.json')
+    const copiedManifest = JSON.parse(await readFile(manifestPath, 'utf8'))
+    copiedManifest.node.path = relative(sidecarCopy, process.execPath)
+    await writeFile(manifestPath, `${canonicalJson(copiedManifest)}\n`)
+    const transitive = join(sidecarCopy, 'runtime-carrier', 'node_modules', '@deepseek-ai', 'dsh-agent', 'lib', 'index.js')
+    await writeFile(transitive, `${await readFile(transitive, 'utf8')}\n// tampered\n`)
+    const parent = await tempRoot('closure-tamper')
+    const sessionRoot = join(parent, 'session')
+    const execution = await execa(process.execPath, [
+      join(sidecarCopy, 'sidecar.mjs'), '--session-root', sessionRoot,
+    ], { input: `${JSON.stringify(await fixture())}\n`, reject: false, timeout: 5_000 })
+    expect(execution.exitCode).toBe(2)
+    expect(JSON.parse(execution.stdout)).toEqual({
+      schemaVersion: 1,
+      kind: 'effiengine.fde-harness-sidecar-error',
+      error: { code: 'MANIFEST_DRIFT' },
+    })
+    await expect(readdir(sessionRoot)).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
   it('proves the enforced adapter profile blocks host read, write, network and unpinned exec', async () => {
     const parent = await tempRoot('sandbox')
     const privateParent = await realpath(parent)
@@ -147,7 +219,7 @@ describe('hardened FDE one-shot Harness sidecar', () => {
     const verified = await verifyRuntimeManifest()
     let profile = await readFile(verified.paths.adapterProfile, 'utf8')
     const parameters = {
-      NODE_PATH: verified.nodePath, LAB_ROOT: fileURLToPath(new URL('../../', import.meta.url)),
+      NODE_PATH: verified.nodePath, SIDECAR_ROOT: sidecarRoot,
       PRIVATE_PARENT: privateParent, RUN_ROOT: await realpath(runRoot),
       SESSION_ROOT: await realpath(sessionRoot),
     }

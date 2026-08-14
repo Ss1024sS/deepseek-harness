@@ -1,6 +1,7 @@
 CLAUDE.local.md
 .env
 node_modules/
+fde-sidecar/runtime-carrier/
 lib/
 *.tsbuildinfo
 pnpm-debug.log

@@ -2,7 +2,7 @@
 
 import { spawn } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { chmod, mkdir, readFile, realpath, stat, unlink } from 'node:fs/promises'
+import { chmod, lstat, mkdir, readFile, readdir, realpath, stat, unlink } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
@@ -26,6 +26,8 @@ const CLEANUP_TIMEOUT_MS = 3_000
 const MAX_SUMMARY_CODE_POINTS = 500
 const MAX_ACTION_TEXT_CODE_POINTS = 300
 const MAX_ACTIONS = 8
+const MAX_RUNTIME_CLOSURE_FILES = 2_048
+const MAX_RUNTIME_CLOSURE_BYTES = 32 * 1024 * 1024
 
 const labRoot = fileURLToPath(new URL('../', import.meta.url))
 const sidecarRoot = join(labRoot, 'fde-sidecar')
@@ -35,7 +37,7 @@ const defaults = {
   adapterProfile: join(sidecarRoot, 'adapter.sb'),
   replayFile: join(sidecarRoot, 'replay', 'session.jsonl'),
   replayOverride: join(sidecarRoot, 'replay', 'replay.override.json'),
-  runtime: join(labRoot, 'packages', 'examples', 'jsonrpc-demo', 'lib', 'bin.js'),
+  runtime: join(sidecarRoot, 'runtime-carrier', 'node_modules', '@deepseek-ai', 'dsh-sdk-jsonrpc-demo', 'lib', 'packaged-bin.js'),
 }
 
 const STATUS_VALUES = new Set([
@@ -250,11 +252,76 @@ async function digestFile(path) {
   return sha256Hex(await readFile(path))
 }
 
+function safeRelativePath(value) {
+  if (typeof value !== 'string' || value === '' || value.startsWith('/') || value.includes('\0')) return false
+  const segments = value.split('/')
+  return segments.every(segment => segment !== '' && segment !== '.' && segment !== '..')
+}
+
+async function verifyRuntimeClosure(manifest, rootPath) {
+  const raw = await readFile(manifest.path)
+  let parsed
+  try { parsed = JSON.parse(raw) } catch { throw new SidecarError('MANIFEST_INVALID') }
+  const closure = record(parsed)
+  exactKeys(closure, ['schemaVersion', 'kind', 'entry', 'files'], 'MANIFEST_INVALID')
+  if (closure.schemaVersion !== 1 || closure.kind !== 'effiengine.fde-harness-runtime-closure'
+    || !safeRelativePath(closure.entry) || !Array.isArray(closure.files)
+    || closure.files.length === 0 || closure.files.length > MAX_RUNTIME_CLOSURE_FILES) {
+    throw new SidecarError('MANIFEST_INVALID')
+  }
+  if (Buffer.compare(raw, Buffer.from(`${canonicalJson(closure)}\n`)) !== 0) throw new SidecarError('MANIFEST_INVALID')
+  if (sha256Hex(raw) !== manifest.sha256) throw new SidecarError('MANIFEST_DRIFT')
+
+  const expected = new Map()
+  let previous
+  let expectedBytes = 0
+  for (const fileValue of closure.files) {
+    const file = record(fileValue)
+    exactKeys(file, ['path', 'mode', 'size', 'sha256'], 'MANIFEST_INVALID')
+    if (!safeRelativePath(file.path) || !Number.isSafeInteger(file.mode) || file.mode < 0 || file.mode > 0o777
+      || !Number.isSafeInteger(file.size) || file.size < 0 || !/^[0-9a-f]{64}$/.test(file.sha256)
+      || previous !== undefined && previous >= file.path) throw new SidecarError('MANIFEST_INVALID')
+    expectedBytes += file.size
+    if (expectedBytes > MAX_RUNTIME_CLOSURE_BYTES) throw new SidecarError('MANIFEST_INVALID')
+    expected.set(file.path, file)
+    previous = file.path
+  }
+  if (!expected.has(closure.entry)) throw new SidecarError('MANIFEST_INVALID')
+
+  const seen = new Set()
+  async function visit(directory, prefix = '') {
+    const entries = await readdir(directory, { withFileTypes: true })
+    entries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0)
+    for (const entry of entries) {
+      const relativePath = prefix === '' ? entry.name : `${prefix}/${entry.name}`
+      const path = join(directory, entry.name)
+      const metadata = await lstat(path)
+      if (metadata.isSymbolicLink()) throw new SidecarError('MANIFEST_DRIFT')
+      if (metadata.isDirectory()) {
+        await visit(path, relativePath)
+        continue
+      }
+      if (!metadata.isFile()) throw new SidecarError('MANIFEST_DRIFT')
+      const file = expected.get(relativePath)
+      if (file === undefined || metadata.size !== file.size || (metadata.mode & 0o777) !== file.mode) {
+        throw new SidecarError('MANIFEST_DRIFT')
+      }
+      if (await digestFile(path) !== file.sha256) throw new SidecarError('MANIFEST_DRIFT')
+      seen.add(relativePath)
+    }
+  }
+  const rootMetadata = await lstat(rootPath)
+  if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) throw new SidecarError('MANIFEST_DRIFT')
+  await visit(rootPath)
+  if (seen.size !== expected.size) throw new SidecarError('MANIFEST_DRIFT')
+  return closure
+}
+
 function validateManifestShape(value) {
   const manifest = record(value)
   exactKeys(manifest, [
     'schemaVersion', 'kind', 'upstreamCommit', 'node', 'sidecar', 'config',
-    'adapterProfile', 'replaySession', 'replayOverride', 'runtimeArtifact',
+    'adapterProfile', 'replaySession', 'replayOverride', 'runtimeArtifact', 'runtimeClosure',
   ], 'MANIFEST_INVALID')
   if (manifest.schemaVersion !== 1 || manifest.kind !== 'effiengine.fde-harness-runtime-manifest'
     || manifest.upstreamCommit !== UPSTREAM_COMMIT) throw new SidecarError('MANIFEST_INVALID')
@@ -270,6 +337,10 @@ function validateManifestShape(value) {
     if (typeof item.path !== 'string' || item.path === '' || item.path.startsWith('/') || item.path.includes('\0')
       || !/^[0-9a-f]{64}$/.test(item.sha256)) throw new SidecarError('MANIFEST_INVALID')
   }
+  const runtimeClosure = record(manifest.runtimeClosure)
+  exactKeys(runtimeClosure, ['path', 'root', 'sha256'], 'MANIFEST_INVALID')
+  if (!safeRelativePath(runtimeClosure.path) || !safeRelativePath(runtimeClosure.root)
+    || !/^[0-9a-f]{64}$/.test(runtimeClosure.sha256)) throw new SidecarError('MANIFEST_INVALID')
   return manifest
 }
 
@@ -287,6 +358,15 @@ export async function verifyRuntimeManifest(options = {}) {
     if (await digestFile(path) !== manifest[key].sha256) throw new SidecarError('MANIFEST_DRIFT')
     paths[key] = path
   }
+  paths.runtimeClosure = await canonicalPathInside(resolve(manifestDir, manifest.runtimeClosure.path), labRoot)
+  paths.runtimeClosureRoot = await canonicalPathInside(resolve(manifestDir, manifest.runtimeClosure.root), labRoot)
+  const runtimeClosure = await verifyRuntimeClosure({
+    path: paths.runtimeClosure,
+    sha256: manifest.runtimeClosure.sha256,
+  }, paths.runtimeClosureRoot)
+  if (paths.runtimeArtifact !== await realpath(join(paths.runtimeClosureRoot, runtimeClosure.entry))) {
+    throw new SidecarError('MANIFEST_INVALID')
+  }
   const nodePath = await realpath(resolve(manifestDir, manifest.node.path))
   if (await realpath(process.execPath) !== nodePath || process.version !== manifest.node.version
     || await digestFile(nodePath) !== manifest.node.sha256) {
@@ -297,6 +377,7 @@ export async function verifyRuntimeManifest(options = {}) {
     manifestDigest: sha256Hex(raw),
     paths,
     nodePath,
+    runtimeClosure,
   }
 }
 
@@ -598,6 +679,7 @@ export class FdeHarnessSidecar {
     this.manifestPath = resolve(options.manifestPath ?? defaults.manifest)
     this.clientFactory = options.clientFactory
     this.precreatedRoots = options.precreatedRoots ?? false
+    this.effectiveProfileDigest = options.effectiveProfileDigest
   }
 
   async analyze(rawRequest) {
@@ -605,6 +687,9 @@ export class FdeHarnessSidecar {
     await proveSandboxActive()
     const { outgoingDigest, payloadCanonical } = validateRequest(rawRequest)
     const verified = await verifyRuntimeManifest({ manifestPath: this.manifestPath })
+    if (!/^sha256:[0-9a-f]{64}$/.test(this.effectiveProfileDigest ?? '')) {
+      throw new SidecarError('SANDBOX_FAILURE')
+    }
     const sessionId = `fde-${randomUUID()}`
     await ensurePrivateDirectory(this.runRoot, !this.precreatedRoots)
     await ensurePrivateDirectory(this.sessionRoot, !this.precreatedRoots)
@@ -695,7 +780,9 @@ export class FdeHarnessSidecar {
       runtime: {
         upstreamCommit: UPSTREAM_COMMIT,
         manifestDigest: `sha256:${verified.manifestDigest}`,
-        adapterProfileDigest: `sha256:${manifest.adapterProfile.sha256}`,
+        adapterTemplateDigest: `sha256:${manifest.adapterProfile.sha256}`,
+        effectiveProfileDigest: this.effectiveProfileDigest,
+        runtimeClosureDigest: `sha256:${manifest.runtimeClosure.sha256}`,
         runtimeArtifactDigest: `sha256:${manifest.runtimeArtifact.sha256}`,
         sidecarDigest: `sha256:${manifest.sidecar.sha256}`,
         providerMode: 'KEYLESS_REPLAY',
@@ -732,7 +819,7 @@ function parseInternalCliArgs(argv) {
   return { sessionRoot: resolve(argv[1]), runRoot: resolve(argv[3]), manifestPath: resolve(argv[5]) }
 }
 
-async function verifyInternalLaunchProof(args, nonce) {
+export async function verifyInternalLaunchProof(args, nonce) {
   if (!/^[0-9a-f]{64}$/.test(nonce ?? '')) throw new SidecarError('SANDBOX_FAILURE')
   const verified = await verifyRuntimeManifest({ manifestPath: args.manifestPath })
   if (await realpath(args.manifestPath) !== await realpath(defaults.manifest)) {
@@ -742,15 +829,22 @@ async function verifyInternalLaunchProof(args, nonce) {
   let proof
   try { proof = JSON.parse(await readFile(proofPath, 'utf8')) } catch { throw new SidecarError('SANDBOX_FAILURE') }
   const value = record(proof)
-  exactKeys(value, ['schemaVersion', 'kind', 'nonceDigest', 'sessionRoot', 'runRoot', 'manifestDigest'], 'SANDBOX_FAILURE')
+  exactKeys(value, [
+    'schemaVersion', 'kind', 'nonceDigest', 'sessionRoot', 'runRoot', 'manifestDigest',
+    'adapterTemplateDigest', 'effectiveProfileDigest',
+  ], 'SANDBOX_FAILURE')
+  const effectiveProfileDigest = sha256(await readFile(join(args.runRoot, 'adapter.generated.sb')))
   if (value.schemaVersion !== 1 || value.kind !== 'effiengine.fde-harness-launch-proof'
     || value.nonceDigest !== sha256(nonce)
     || value.sessionRoot !== await realpath(args.sessionRoot)
     || value.runRoot !== await realpath(args.runRoot)
-    || value.manifestDigest !== `sha256:${verified.manifestDigest}`) {
+    || value.manifestDigest !== `sha256:${verified.manifestDigest}`
+    || value.adapterTemplateDigest !== `sha256:${verified.manifest.adapterProfile.sha256}`
+    || value.effectiveProfileDigest !== effectiveProfileDigest) {
     throw new SidecarError('SANDBOX_FAILURE')
   }
   try { await unlink(proofPath) } catch { throw new SidecarError('SANDBOX_FAILURE') }
+  return effectiveProfileDigest
 }
 
 async function launchSandboxedAdapter({ sessionRoot, runRoot }) {
@@ -761,13 +855,14 @@ async function launchSandboxedAdapter({ sessionRoot, runRoot }) {
   const profileTemplate = await readFile(verified.paths.adapterProfile, 'utf8')
   const profile = replaceProfileParameters(profileTemplate, {
     NODE_PATH: verified.nodePath,
-    LAB_ROOT: await realpath(labRoot),
+    SIDECAR_ROOT: await realpath(sidecarRoot),
     PRIVATE_PARENT: await realpath(dirname(runRoot)),
     RUN_ROOT: await realpath(runRoot),
     SESSION_ROOT: await realpath(sessionRoot),
   })
   const profilePath = join(runRoot, 'adapter.generated.sb')
   await writePrivateFile(profilePath, profile)
+  const effectiveProfileDigest = sha256(profile)
   const nonce = randomBytes(32).toString('hex')
   const proof = {
     schemaVersion: 1,
@@ -776,6 +871,8 @@ async function launchSandboxedAdapter({ sessionRoot, runRoot }) {
     sessionRoot: await realpath(sessionRoot),
     runRoot: await realpath(runRoot),
     manifestDigest: `sha256:${verified.manifestDigest}`,
+    adapterTemplateDigest: `sha256:${verified.manifest.adapterProfile.sha256}`,
+    effectiveProfileDigest,
   }
   await writePrivateFile(join(runRoot, 'launcher.proof'), `${canonicalJson(proof)}\n`)
   const env = {
@@ -845,10 +942,12 @@ async function main() {
     if (internalArgs) {
       if (process.env.FDE_ADAPTER_SANDBOXED !== '1') throw new SidecarError('SANDBOX_FAILURE')
       const args = parseInternalCliArgs(process.argv.slice(2))
-      await verifyInternalLaunchProof(args, process.env.FDE_ADAPTER_LAUNCH_NONCE)
+      const effectiveProfileDigest = await verifyInternalLaunchProof(args, process.env.FDE_ADAPTER_LAUNCH_NONCE)
       await proveSandboxActive()
       const request = await readSingleInputLine()
-      const receipt = await new FdeHarnessSidecar({ ...args, precreatedRoots: true }).analyze(request)
+      const receipt = await new FdeHarnessSidecar({
+        ...args, precreatedRoots: true, effectiveProfileDigest,
+      }).analyze(request)
       process.stdout.write(`${canonicalJson(receipt)}\n`)
     } else {
       if (process.env.FDE_ADAPTER_SANDBOXED !== undefined

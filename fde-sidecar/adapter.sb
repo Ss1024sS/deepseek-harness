@@ -9,10 +9,10 @@
 (allow signal (target children))
 (allow process-info-pidinfo (target children))
 
-; Node bootstrap plus the fixed lab checkout are read-only.
+; Node bootstrap plus the pinned sidecar assets and carrier are read-only.
 (allow file-read* (literal "/") (literal "/dev/null"))
 (allow file-read* (subpath "/System") (subpath "/usr/lib") (subpath "/usr/share"))
-(allow file-read* (subpath "@@LAB_ROOT@@"))
+(allow file-read* (subpath "@@SIDECAR_ROOT@@"))
 (allow file-read* (literal "@@NODE_PATH@@") (literal "/private/etc/passwd"))
 (allow file-read-metadata)
 (allow sysctl-read

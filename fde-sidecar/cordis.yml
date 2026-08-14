@@ -3,12 +3,12 @@
 # web, telemetry, or live network model provider.
 
 - id: sdk-jsonrpc-server
-  name: '../packages/sdk/server/lib/index.js'
+  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
   config:
     maxTokensAsSuccess: false
 
 - id: agent-spine
-  name: '../packages/examples/agent-spine-demo/lib/index.js'
+  name: '@deepseek-ai/dsh-agent-spine-demo'
   config:
     includeHarnessIdentity: false
     includeRuntimeContext: false
@@ -26,7 +26,7 @@
     goals: false
 
 - id: sessions
-  name: '../packages/session/session-persistence-jsonl/lib/index.js'
+  name: '@deepseek-ai/dsh-session-persistence-jsonl'
   config:
     root: !!js process.env.FDE_SIDECAR_SESSION_ROOT
     compression: none
@@ -36,10 +36,10 @@
 # Persistence owns storage; this policy makes completed requests and steps
 # explicit durability checkpoints before the one-shot runtime shuts down.
 - id: session-checkpoints
-  name: '../packages/session/session-checkpoint-policy/lib/index.js'
+  name: '@deepseek-ai/dsh-session-checkpoint-policy'
 
 - id: llm-replay
-  name: '../packages/test-support/llm-replay/lib/index.js'
+  name: '@deepseek-ai/dsh-llm-replay'
   config:
     file: !!js process.env.FDE_SIDECAR_REPLAY_FILE
     overrideFile: !!js process.env.FDE_SIDECAR_REPLAY_OVERRIDE
