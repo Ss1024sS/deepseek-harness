@@ -21,6 +21,8 @@ import type {
   SessionEventNotification,
   SessionPromptParams,
   SessionPromptResult,
+  SessionResumeParams,
+  SessionResumeResult,
   SubagentFinishedNotification,
   SubagentStartedNotification,
 } from '@deepseek-ai/dsh-sdk-protocol'
@@ -56,6 +58,8 @@ export class HarnessSdkJsonRpcServer {
   private model = 'deepseek-official'
   private maxTokens: number | undefined
   private llmFiber: { dispose(): Promise<void> } | undefined
+  private initialized = false
+  private initializationTask: Promise<InitializeResult> | undefined
   private readonly sessions = new Map<string, SessionRecord>()
   private readonly sessionCreations = new Map<string, Promise<SessionRecord>>()
   private readonly disposers: (() => void)[] = []
@@ -109,19 +113,69 @@ export class HarnessSdkJsonRpcServer {
    * @returns server identity for the handshake.
    */
   async initialize(params: InitializeParams): Promise<InitializeResult> {
+    if (this.initialized || this.initializationTask) throw new Error('SDK server is already initialized')
+    if (this.shuttingDown) throw new Error('SDK server is shutting down')
+    const initialization = this.performInitialize(params)
+    this.initializationTask = initialization
+    try {
+      return await initialization
+    } finally {
+      if (this.initializationTask === initialization) this.initializationTask = undefined
+    }
+  }
+
+  private async performInitialize(params: InitializeParams): Promise<InitializeResult> {
     if (params.maxTokens !== undefined
       && (!Number.isSafeInteger(params.maxTokens) || params.maxTokens <= 0)) {
       throw new TypeError('initialize maxTokens must be a positive safe integer')
     }
-    this.cwd = resolve(params.cwd)
-    this.provider = params.provider
-    this.model = params.model
-    this.maxTokens = params.maxTokens
-    if (!this.hasAdapterFor(this.provider)) {
-      if (this.provider !== 'deepseek-official') throw new Error(`no adapter registered for provider "${this.provider}"`)
-      this.llmFiber = await this.ctx.plugin(LlmDeepSeek, {})
+    const cwd = resolve(params.cwd)
+    const provider = params.provider
+    const model = params.model
+    let llmFiber: { dispose(): Promise<void> } | undefined
+    if (!this.hasAdapterFor(provider)) {
+      if (provider !== 'deepseek-official') throw new Error(`no adapter registered for provider "${provider}"`)
+      llmFiber = await this.ctx.plugin(LlmDeepSeek, {})
     }
-    return { serverInfo: { name: 'deepseek-harness-sdk-runtime', version: '0.0.1' } }
+    this.cwd = cwd
+    this.provider = provider
+    this.model = model
+    this.maxTokens = params.maxTokens
+    this.llmFiber = llmFiber
+    this.initialized = true
+    return { serverInfo: { name: 'deepseek-harness-sdk-runtime', version: '0.0.2' } }
+  }
+
+  /**
+   * Restore one persisted session into this initialized runtime before prompting it.
+   * Rejects an unknown session, a session already open or opening in this server,
+   * shutdown, and a persisted cwd that differs from the initialized cwd.
+   * @param params - exact persisted session identity.
+   * @returns the restored durable-prefix count and next live sequence number.
+   */
+  async resume(params: SessionResumeParams): Promise<SessionResumeResult> {
+    this.requireInitialized()
+    const sessionId = params.sessionId
+    if (typeof sessionId !== 'string' || sessionId.length === 0) {
+      throw new TypeError('session/resume sessionId must be a non-empty string')
+    }
+    if (this.shuttingDown) throw new Error('SDK server is shutting down')
+    if (this.sessions.has(sessionId) || this.sessionCreations.has(sessionId)) {
+      throw new Error(`session "${sessionId}" is already open`)
+    }
+    const creation = this.resumeSession(sessionId)
+    this.sessionCreations.set(sessionId, creation)
+    let rec: SessionRecord
+    try {
+      rec = await creation
+    } finally {
+      if (this.sessionCreations.get(sessionId) === creation) this.sessionCreations.delete(sessionId)
+    }
+    return {
+      sessionId,
+      durablePrefixCount: rec.handle.agent.session.firstLiveSeq,
+      nextSeq: rec.handle.agent.session.seq,
+    }
   }
 
   /**
@@ -130,6 +184,7 @@ export class HarnessSdkJsonRpcServer {
    * @returns the durable message identity.
    */
   async prompt(params: SessionPromptParams): Promise<SessionPromptResult> {
+    this.requireInitialized()
     const rec = await this.getOrCreateSession(params.sessionId)
     // An agent-loop-only reload disposes the loop's agents while this record
     // survives; a retained agent accepts followup() silently, so validate the
@@ -154,6 +209,9 @@ export class HarnessSdkJsonRpcServer {
 
   private async performShutdown(): Promise<Record<string, never>> {
     this.shuttingDown = true
+    if (this.initializationTask !== undefined) {
+      await Promise.allSettled([this.initializationTask])
+    }
     const pendingCreations = [...this.sessionCreations.values()]
     await Promise.allSettled(pendingCreations)
     this.sessionCreations.clear()
@@ -191,6 +249,8 @@ export class HarnessSdkJsonRpcServer {
     switch (method) {
       case 'initialize':
         return this.initialize(params as unknown as InitializeParams)
+      case 'session/resume':
+        return this.resume(params as unknown as SessionResumeParams)
       case 'session/prompt':
         return this.prompt(params as unknown as SessionPromptParams)
       case 'shutdown':
@@ -215,6 +275,10 @@ export class HarnessSdkJsonRpcServer {
     return creation
   }
 
+  private requireInitialized(): void {
+    if (!this.initialized) throw new Error('SDK server is not initialized')
+  }
+
   private async createSession(sessionId: string): Promise<SessionRecord> {
     // No preset composition: this server's compositions keep the model-facing
     // rows in the host plane, so this agent reads them from the global layer. A
@@ -229,6 +293,24 @@ export class HarnessSdkJsonRpcServer {
         ...this.maxTokens === undefined ? {} : { maxTokens: this.maxTokens },
       },
     })
+    const rec: SessionRecord = { handle }
+    this.sessions.set(sessionId, rec)
+    return rec
+  }
+
+  private async resumeSession(sessionId: string): Promise<SessionRecord> {
+    const handle = await this.ctx.agents.resume({
+      resumeSessionId: SessionId(sessionId),
+      agentOptions: {
+        provider: this.provider,
+        model: this.model,
+        ...this.maxTokens === undefined ? {} : { maxTokens: this.maxTokens },
+      },
+    })
+    if (handle.agent.session.header.cwd !== this.cwd) {
+      await handle.dispose()
+      throw new Error(`persisted session "${sessionId}" cwd does not match initialize cwd`)
+    }
     const rec: SessionRecord = { handle }
     this.sessions.set(sessionId, rec)
     return rec

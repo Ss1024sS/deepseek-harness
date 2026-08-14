@@ -26,7 +26,8 @@
 (allow file-read*
   (literal "@@PRIVATE_PARENT@@")
   (literal "@@RUN_ROOT@@") (subpath "@@RUN_ROOT@@")
-  (literal "@@SESSION_ROOT@@") (subpath "@@SESSION_ROOT@@"))
+  (literal "@@SESSION_ROOT@@") (subpath "@@SESSION_ROOT@@")
+  (literal "@@SESSION_LOCK_PATH@@"))
 (allow file-write*
   (literal "@@RUN_ROOT@@") (subpath "@@RUN_ROOT@@")
   (literal "@@SESSION_ROOT@@") (subpath "@@SESSION_ROOT@@"))

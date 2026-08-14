@@ -1,6 +1,6 @@
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { cp, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
+import { cp, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
@@ -11,7 +11,9 @@ import {
   BoundedJsonRpcClient,
   SidecarError,
   canonicalJson,
+  inspectDurableSession,
   parseAdvice,
+  sessionLockPathFor,
   validateRequest,
   verifyDurableSession,
   verifyInternalLaunchProof,
@@ -21,6 +23,7 @@ import {
 const execFileAsync = promisify(execFile)
 const sidecarRoot = dirname(fileURLToPath(new URL('../sidecar.mjs', import.meta.url)))
 const roots = []
+const EMPTY_EVENT_DIGEST = 'sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
 
 async function fixture() {
   return JSON.parse((await readFile(join(sidecarRoot, 'fixtures/aggregate-review.jsonl'), 'utf8')).trim())
@@ -85,6 +88,32 @@ async function tempRoot(label) {
   const root = await mkdtemp(join(tmpdir(), `fde-sidecar-${label}-`))
   roots.push(root)
   return root
+}
+
+async function waitForPath(path) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    try { return await lstat(path) } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+    }
+    await new Promise(resolveWait => setTimeout(resolveWait, 10))
+  }
+  throw new Error(`timed out waiting for ${path}`)
+}
+
+function collectChild(child) {
+  const stdout = []
+  const stderr = []
+  child.stdout.on('data', chunk => stdout.push(chunk))
+  child.stderr.on('data', chunk => stderr.push(chunk))
+  return new Promise((resolveChild, rejectChild) => {
+    child.once('error', rejectChild)
+    child.once('close', (code, signal) => resolveChild({
+      code,
+      signal,
+      stdout: Buffer.concat(stdout).toString('utf8'),
+      stderr: Buffer.concat(stderr).toString('utf8'),
+    }))
+  })
 }
 
 afterEach(async () => {
@@ -208,7 +237,7 @@ describe('hardened FDE one-shot Harness sidecar', () => {
     const sessionRoot = join(parent, 'session-leaf')
     const input = await fixture()
     const execution = await execa(process.execPath, [
-      join(sidecarRoot, 'sidecar.mjs'), '--session-root', sessionRoot,
+      join(sidecarRoot, 'sidecar.mjs'), '--start-session-root', sessionRoot,
     ], { input: `${JSON.stringify(input)}\n`, timeout: 5_000 })
     expect(execution.stderr).toBe('')
     const receipt = JSON.parse(execution.stdout)
@@ -234,6 +263,11 @@ describe('hardened FDE one-shot Harness sidecar', () => {
       'fdeMutationExecuted', 'manifestDigest', 'modelInferenceExecuted', 'networkPolicy',
       'providerMode', 'runtimeArtifactDigest', 'runtimeClosureDigest', 'sessionPersistenceExecuted',
       'sidecarDigest', 'toolsExposed', 'upstreamCommit',
+    ])
+    expect(Object.keys(receipt.evidence).sort()).toEqual([
+      'completedTurn', 'eventCount', 'eventDigest', 'inputDigest', 'lastEventSeq',
+      'priorEventCount', 'priorEventDigest', 'providerContinuationDigest', 'rawReasoningPersisted',
+      'resumeMode', 'sessionIdentityDigest', 'toolCallCount',
     ])
     for (const key of [
       'manifestDigest', 'adapterTemplateDigest', 'effectiveProfileDigest',
@@ -270,7 +304,7 @@ describe('hardened FDE one-shot Harness sidecar', () => {
     const sessionRoot = join(parent, 'session-leaf')
     const input = await v2Fixture()
     const execution = await execa(process.execPath, [
-      join(sidecarRoot, 'sidecar.mjs'), '--session-root', sessionRoot,
+      join(sidecarRoot, 'sidecar.mjs'), '--start-session-root', sessionRoot,
     ], { input: `${JSON.stringify(input)}\n`, timeout: 5_000 })
     expect(execution.stderr).toBe('')
     const receipt = JSON.parse(execution.stdout)
@@ -301,6 +335,182 @@ describe('hardened FDE one-shot Harness sidecar', () => {
     expect(log).not.toContain('"redactedText":')
   })
 
+  it('serializes real cross-process resumes and preserves a restart-safe visible capsule', async () => {
+    const parent = await tempRoot('p2-l2b-resume')
+    const sessionRoot = join(parent, 'session-leaf')
+    const firstInput = await v2Fixture()
+    const firstExecution = await execa(process.execPath, [
+      join(sidecarRoot, 'sidecar.mjs'), '--start-session-root', sessionRoot,
+    ], { input: `${JSON.stringify(firstInput)}\n`, timeout: 5_000 })
+    expect(firstExecution.stderr).toBe('')
+    const firstReceipt = JSON.parse(firstExecution.stdout)
+    expect(firstReceipt.evidence).toMatchObject({
+      priorEventCount: 0,
+      completedTurn: 1,
+      providerContinuationDigest: null,
+      rawReasoningPersisted: false,
+      toolCallCount: 0,
+    })
+    expect(firstReceipt.evidence.priorEventDigest).toBe(EMPTY_EVENT_DIGEST)
+    expect(firstReceipt.evidence.sessionIdentityDigest).toMatch(/^sha256:[0-9a-f]{64}$/)
+    expect(firstReceipt.evidence.lastEventSeq).toBe(firstReceipt.evidence.eventCount - 1)
+
+    const findLog = async () => {
+      const files = (await readdir(sessionRoot, { recursive: true }))
+        .filter(path => path.endsWith('session.jsonl'))
+      expect(files).toHaveLength(1)
+      return join(sessionRoot, files[0])
+    }
+    const logPath = await findLog()
+    const firstRows = (await readFile(logPath, 'utf8')).trimEnd().split('\n').map(line => JSON.parse(line))
+    const firstEvents = firstRows.slice(1)
+    expect(firstEvents).toHaveLength(firstReceipt.evidence.eventCount)
+
+    const secondInput = structuredClone(await v2Fixture())
+    secondInput.payload.facts.counts.capabilityGaps = 0
+    secondInput.outgoingDigest = payloadDigest(secondInput.payload)
+    const secondArgs = [
+      join(sidecarRoot, 'sidecar.mjs'), '--resume-session-root', sessionRoot,
+      '--expected-event-count', String(firstReceipt.evidence.eventCount),
+      '--expected-event-digest', firstReceipt.evidence.eventDigest,
+      '--expected-session-identity-digest', firstReceipt.evidence.sessionIdentityDigest,
+    ]
+    const winner = spawn(process.execPath, secondArgs, { stdio: ['pipe', 'pipe', 'pipe'] })
+    const winnerResultTask = collectChild(winner)
+    const lockPath = sessionLockPathFor(sessionRoot)
+    await waitForPath(lockPath)
+    const beforeContender = await readFile(logPath)
+
+    const contender = await execa(process.execPath, secondArgs, {
+      input: `${JSON.stringify(secondInput)}\n`, reject: false, timeout: 5_000,
+    })
+    expect(contender.exitCode).toBe(2)
+    expect(contender.stderr).toBe('')
+    expect(JSON.parse(contender.stdout)).toEqual({
+      schemaVersion: 1,
+      kind: 'effiengine.fde-harness-sidecar-error',
+      error: { code: 'SESSION_BUSY' },
+    })
+    expect(await readFile(logPath)).toEqual(beforeContender)
+
+    winner.stdin.end(`${JSON.stringify(secondInput)}\n`)
+    const secondExecution = await winnerResultTask
+    expect(secondExecution).toMatchObject({ code: 0, signal: null, stderr: '' })
+    const secondReceipt = JSON.parse(secondExecution.stdout)
+    expect(secondReceipt.evidence).toMatchObject({
+      priorEventCount: firstReceipt.evidence.eventCount,
+      priorEventDigest: firstReceipt.evidence.eventDigest,
+      completedTurn: 2,
+      providerContinuationDigest: null,
+      rawReasoningPersisted: false,
+      toolCallCount: 0,
+    })
+    expect(secondReceipt.evidence.lastEventSeq).toBe(secondReceipt.evidence.eventCount - 1)
+    expect(secondReceipt.evidence.sessionIdentityDigest).toBe(firstReceipt.evidence.sessionIdentityDigest)
+    expect(secondReceipt.outcome.suggestion.summary).toContain('历史能力缺口=2')
+    await expect(lstat(lockPath)).rejects.toMatchObject({ code: 'ENOENT' })
+
+    const thirdInput = structuredClone(await v2Fixture())
+    thirdInput.payload.facts.counts.capabilityGaps = 1
+    thirdInput.outgoingDigest = payloadDigest(thirdInput.payload)
+    const thirdExecution = await execa(process.execPath, [
+      join(sidecarRoot, 'sidecar.mjs'), '--resume-session-root', sessionRoot,
+      '--expected-event-count', String(secondReceipt.evidence.eventCount),
+      '--expected-event-digest', secondReceipt.evidence.eventDigest,
+      '--expected-session-identity-digest', secondReceipt.evidence.sessionIdentityDigest,
+    ], { input: `${JSON.stringify(thirdInput)}\n`, timeout: 5_000 })
+    expect(thirdExecution.stderr).toBe('')
+    const thirdReceipt = JSON.parse(thirdExecution.stdout)
+    expect(thirdReceipt.evidence).toMatchObject({
+      priorEventCount: secondReceipt.evidence.eventCount,
+      priorEventDigest: secondReceipt.evidence.eventDigest,
+      sessionIdentityDigest: firstReceipt.evidence.sessionIdentityDigest,
+      completedTurn: 3,
+      providerContinuationDigest: null,
+      rawReasoningPersisted: false,
+      toolCallCount: 0,
+    })
+
+    const finalRows = (await readFile(logPath, 'utf8')).trimEnd().split('\n').map(line => JSON.parse(line))
+    const finalEvents = finalRows.slice(1)
+    expect(finalEvents.slice(0, firstEvents.length)).toEqual(firstEvents)
+    expect(finalEvents.map(event => event.seq)).toEqual(finalEvents.map((_, index) => index))
+    expect(finalEvents.filter(event => event.type === 'session/end-seed')).toEqual([
+      expect.objectContaining({ seq: firstEvents.length, data: {} }),
+      expect.objectContaining({ seq: secondReceipt.evidence.eventCount, data: {} }),
+    ])
+    expect(finalEvents.filter(event => event.type === 'turn/start').map(event => event.data.turn)).toEqual([1, 2, 3])
+    expect(finalEvents.filter(event => event.type === 'user/message').map(event => event.data.content[0].text))
+      .toEqual([
+        canonicalJson(firstInput.payload), canonicalJson(secondInput.payload), canonicalJson(thirdInput.payload),
+      ])
+    const sessionEntries = await readdir(sessionRoot, { recursive: true, withFileTypes: true })
+    expect(sessionEntries.filter(entry => entry.isFile()).map(entry => entry.name)).toEqual(['session.jsonl'])
+    expect(sessionEntries.filter(entry => !entry.isFile() && !entry.isDirectory())).toEqual([])
+  })
+
+  it('rejects a stale resume cursor before changing the durable Session', async () => {
+    const parent = await tempRoot('p2-l2b-stale')
+    const sessionRoot = join(parent, 'session-leaf')
+    const input = await v2Fixture()
+    const firstExecution = await execa(process.execPath, [
+      join(sidecarRoot, 'sidecar.mjs'), '--start-session-root', sessionRoot,
+    ], { input: `${JSON.stringify(input)}\n`, timeout: 5_000 })
+    const firstReceipt = JSON.parse(firstExecution.stdout)
+    const files = (await readdir(sessionRoot, { recursive: true })).filter(path => path.endsWith('session.jsonl'))
+    const logPath = join(sessionRoot, files[0])
+    const before = await readFile(logPath)
+
+    const expectStale = async ({
+      root = sessionRoot,
+      path = logPath,
+      count = firstReceipt.evidence.eventCount,
+      digest = firstReceipt.evidence.eventDigest,
+      identity = firstReceipt.evidence.sessionIdentityDigest,
+      expectedBytes = before,
+    } = {}) => {
+      const execution = await execa(process.execPath, [
+        join(sidecarRoot, 'sidecar.mjs'), '--resume-session-root', root,
+        '--expected-event-count', String(count), '--expected-event-digest', digest,
+        '--expected-session-identity-digest', identity,
+      ], { input: `${JSON.stringify(input)}\n`, reject: false, timeout: 5_000 })
+      expect(execution.exitCode).toBe(2)
+      expect(JSON.parse(execution.stdout)).toEqual({
+        schemaVersion: 1,
+        kind: 'effiengine.fde-harness-sidecar-error',
+        error: { code: 'CONTINUATION_STALE' },
+      })
+      expect(await readFile(path)).toEqual(expectedBytes)
+    }
+    await expectStale({ count: firstReceipt.evidence.eventCount + 1 })
+    const digestHex = firstReceipt.evidence.eventDigest.slice('sha256:'.length)
+    const wrongDigest = `sha256:${digestHex[0] === '0' ? '1' : '0'}${digestHex.slice(1)}`
+    await expectStale({ digest: wrongDigest })
+
+    for (const mutateHeader of [
+      header => { header.id = `${header.id}-swapped` },
+      header => { header.createdAt += 1 },
+    ]) {
+      const rows = before.toString('utf8').trimEnd().split('\n').map(line => JSON.parse(line))
+      mutateHeader(rows[0])
+      const mutated = Buffer.from(`${rows.map(row => JSON.stringify(row)).join('\n')}\n`)
+      await writeFile(logPath, mutated)
+      await expectStale({ expectedBytes: mutated })
+      await writeFile(logPath, before)
+    }
+
+    const swappedRoot = join(parent, 'renamed-session-leaf')
+    await cp(sessionRoot, swappedRoot, { recursive: true })
+    const swappedFiles = (await readdir(swappedRoot, { recursive: true })).filter(path => path.endsWith('session.jsonl'))
+    const swappedLogPath = join(swappedRoot, swappedFiles[0])
+    const swappedRows = (await readFile(swappedLogPath, 'utf8')).trimEnd().split('\n').map(line => JSON.parse(line))
+    swappedRows[0].id = `${swappedRows[0].id}-renamed`
+    swappedRows[0].cwd = await realpath(swappedRoot)
+    const swappedBytes = Buffer.from(`${swappedRows.map(row => JSON.stringify(row)).join('\n')}\n`)
+    await writeFile(swappedLogPath, swappedBytes)
+    await expectStale({ root: swappedRoot, path: swappedLogPath, expectedBytes: swappedBytes })
+  })
+
   it('rejects a P2-L1 text leak at the public CLI before creating a Session', async () => {
     const parent = await tempRoot('v2-public-leak')
     const sessionRoot = join(parent, 'session-leaf')
@@ -308,7 +518,7 @@ describe('hardened FDE one-shot Harness sidecar', () => {
       payload.facts.contentPrivacy.rawText = '原文不得进入 Harness'
     })
     const execution = await execa(process.execPath, [
-      join(sidecarRoot, 'sidecar.mjs'), '--session-root', sessionRoot,
+      join(sidecarRoot, 'sidecar.mjs'), '--start-session-root', sessionRoot,
     ], { input: `${JSON.stringify(input)}\n`, reject: false, timeout: 5_000 })
     expect(execution.exitCode).toBe(2)
     expect(execution.stderr).toBe('')
@@ -324,10 +534,10 @@ describe('hardened FDE one-shot Harness sidecar', () => {
     const input = await fixture()
     const first = await tempRoot('fresh-a')
     const second = await tempRoot('fresh-b')
-    await execa(process.execPath, [join(sidecarRoot, 'sidecar.mjs'), '--session-root', join(first, 'session')], {
+    await execa(process.execPath, [join(sidecarRoot, 'sidecar.mjs'), '--start-session-root', join(first, 'session')], {
       input: `${JSON.stringify(input)}\n`, timeout: 5_000,
     })
-    await execa(process.execPath, [join(sidecarRoot, 'sidecar.mjs'), '--session-root', join(second, 'session')], {
+    await execa(process.execPath, [join(sidecarRoot, 'sidecar.mjs'), '--start-session-root', join(second, 'session')], {
       input: `${JSON.stringify(input)}\n`, timeout: 5_000,
     })
     const readHeader = async root => {
@@ -337,7 +547,7 @@ describe('hardened FDE one-shot Harness sidecar', () => {
     expect((await readHeader(first)).id).not.toBe((await readHeader(second)).id)
   })
 
-  it('rejects an effective adapter profile changed after the launch proof was written', async () => {
+  it('rejects inherited lock identity or effective profile drift from the launch proof', async () => {
     const runRoot = await tempRoot('profile-proof')
     const sessionRoot = join(runRoot, 'session')
     await mkdir(sessionRoot, { mode: 0o700 })
@@ -345,8 +555,22 @@ describe('hardened FDE one-shot Harness sidecar', () => {
     const verified = await verifyRuntimeManifest()
     const original = '(version 1)\n'
     const effectiveProfileDigest = `sha256:${createHash('sha256').update(original).digest('hex')}`
-    await writeFile(join(runRoot, 'adapter.generated.sb'), original, { mode: 0o600 })
-    await writeFile(join(runRoot, 'launcher.proof'), `${canonicalJson({
+    const lockPath = sessionLockPathFor(sessionRoot)
+    const lockHandle = await open(lockPath, 'wx', 0o600)
+    const lockMetadata = await lockHandle.stat({ bigint: true })
+    const profilePath = join(runRoot, 'adapter.generated.sb')
+    const proofPath = join(runRoot, 'launcher.proof')
+    const launchArgs = {
+      sessionRoot,
+      runRoot,
+      manifestPath: join(sidecarRoot, 'runtime-manifest.json'),
+      sessionMode: 'start',
+      expectedEventCount: 0,
+      expectedEventDigest: EMPTY_EVENT_DIGEST,
+      expectedSessionIdentityDigest: null,
+      sessionLockFd: lockHandle.fd,
+    }
+    const proof = {
       schemaVersion: 1,
       kind: 'effiengine.fde-harness-launch-proof',
       nonceDigest: `sha256:${createHash('sha256').update(nonce).digest('hex')}`,
@@ -355,13 +579,31 @@ describe('hardened FDE one-shot Harness sidecar', () => {
       manifestDigest: `sha256:${verified.manifestDigest}`,
       adapterTemplateDigest: `sha256:${verified.manifest.adapterProfile.sha256}`,
       effectiveProfileDigest,
-    })}\n`, { mode: 0o600 })
-    await writeFile(join(runRoot, 'adapter.generated.sb'), '(version 1)\n(allow default)\n')
-    await expect(verifyInternalLaunchProof({
-      sessionRoot,
-      runRoot,
-      manifestPath: join(sidecarRoot, 'runtime-manifest.json'),
-    }, nonce)).rejects.toMatchObject({ code: 'SANDBOX_FAILURE' })
+      sessionMode: 'start',
+      expectedEventCount: 0,
+      expectedEventDigest: EMPTY_EVENT_DIGEST,
+      expectedSessionIdentityDigest: null,
+      sessionLockPath: await realpath(lockPath),
+      sessionLockFd: lockHandle.fd,
+      sessionLockDevice: String(lockMetadata.dev),
+      sessionLockInode: String(lockMetadata.ino),
+    }
+    await writeFile(profilePath, original, { mode: 0o600 })
+    try {
+      await writeFile(proofPath, `${canonicalJson({
+        ...proof, sessionLockInode: String(lockMetadata.ino + 1n),
+      })}\n`, { mode: 0o600 })
+      await expect(verifyInternalLaunchProof(launchArgs, nonce))
+        .rejects.toMatchObject({ code: 'SANDBOX_FAILURE' })
+
+      await writeFile(proofPath, `${canonicalJson(proof)}\n`)
+      await writeFile(profilePath, '(version 1)\n(allow default)\n')
+      await expect(verifyInternalLaunchProof(launchArgs, nonce))
+        .rejects.toMatchObject({ code: 'SANDBOX_FAILURE' })
+    } finally {
+      await lockHandle.close()
+      await unlink(lockPath)
+    }
   })
 
   it('fails the public CLI before Session creation when one transitive carrier JS file is changed', async () => {
@@ -378,7 +620,7 @@ describe('hardened FDE one-shot Harness sidecar', () => {
     const parent = await tempRoot('closure-tamper')
     const sessionRoot = join(parent, 'session')
     const execution = await execa(process.execPath, [
-      join(sidecarCopy, 'sidecar.mjs'), '--session-root', sessionRoot,
+      join(sidecarCopy, 'sidecar.mjs'), '--start-session-root', sessionRoot,
     ], { input: `${JSON.stringify(await fixture())}\n`, reject: false, timeout: 5_000 })
     expect(execution.exitCode).toBe(2)
     expect(JSON.parse(execution.stdout)).toEqual({
@@ -402,6 +644,7 @@ describe('hardened FDE one-shot Harness sidecar', () => {
       NODE_PATH: verified.nodePath, SIDECAR_ROOT: sidecarRoot,
       PRIVATE_PARENT: privateParent, RUN_ROOT: await realpath(runRoot),
       SESSION_ROOT: await realpath(sessionRoot),
+      SESSION_LOCK_PATH: join(privateParent, 'probe-session.fde-session.lock'),
     }
     for (const [key, value] of Object.entries(parameters)) profile = profile.replaceAll(`@@${key}@@`, value)
     const profilePath = join(runRoot, 'probe.sb'); await writeFile(profilePath, profile, { mode: 0o600 })
@@ -425,7 +668,7 @@ describe('hardened FDE one-shot Harness sidecar', () => {
     const parent = await tempRoot('cli')
     const input = `${JSON.stringify(await fixture())}\n${JSON.stringify(await fixture())}\n`
     await expect(execa(process.execPath, [
-      join(sidecarRoot, 'sidecar.mjs'), '--session-root', join(parent, 'session'),
+      join(sidecarRoot, 'sidecar.mjs'), '--start-session-root', join(parent, 'session'),
     ], { input, timeout: 5_000 })).rejects.toMatchObject({ exitCode: 2 })
   })
 
@@ -489,15 +732,65 @@ describe('hardened FDE one-shot Harness sidecar', () => {
       type: 'session', version: 0, id: 'fde-test', createdAt: 1,
       cwd: canonicalRoot, delegationDepth: 0,
     }
-    const expected = [{ type: 'turn/end', seq: 0, time: 2, data: { turn: 1, reason: { kind: 'completed' } } }]
+    const expected = [
+      { type: 'turn/start', seq: 0, time: 2, data: { turn: 1 } },
+      { type: 'turn/end', seq: 1, time: 3, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]
     const check = rows => verifyDurableSession(`${rows.map(row => JSON.stringify(row)).join('\n')}\n`, {
       sessionId: 'fde-test', sessionRoot: canonicalRoot, expectedEvents: expected,
     })
 
-    expect(() => check([header, ...expected, { type: 'tool/call', seq: 1, time: 3, data: {} }]))
+    expect(() => check([header, ...expected, { type: 'tool/call', seq: 2, time: 4, data: {} }]))
       .toThrowError(expect.objectContaining({ code: 'TOOLS_EXPOSED' }))
-    expect(() => check([header, ...expected, { type: 'assistant/message', seq: 1, time: 3, data: {} }]))
+    expect(() => check([header, ...expected, { type: 'assistant/message', seq: 2, time: 4, data: {} }]))
       .toThrowError(expect.objectContaining({ code: 'PERSISTENCE_NOT_PROVEN' }))
+  })
+
+  it('rejects durable cursor, cwd, turn and raw-reasoning drift before resume', async () => {
+    const root = await tempRoot('resume-prefix-counterexamples')
+    const canonicalRoot = await realpath(root)
+    const header = {
+      type: 'session', version: 0, id: 'fde-resume', createdAt: 1,
+      cwd: canonicalRoot, delegationDepth: 0,
+    }
+    const complete = [
+      { type: 'turn/start', seq: 0, time: 2, data: { turn: 1 } },
+      { type: 'assistant/chunk', seq: 1, time: 3, data: {
+        turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'safe' },
+      } },
+      { type: 'turn/end', seq: 2, time: 4, data: { turn: 1, reason: { kind: 'completed' } } },
+    ]
+    const inspect = (rows, sessionRoot = canonicalRoot) => inspectDurableSession(
+      `${[header, ...rows].map(row => JSON.stringify(row)).join('\n')}\n`,
+      { sessionRoot },
+    )
+    expect(inspect(complete)).toMatchObject({ eventCount: 3, lastEventSeq: 2, completedTurn: 1 })
+
+    const badSeq = structuredClone(complete); badSeq[1].seq = 2
+    expect(() => inspect(badSeq)).toThrowError(expect.objectContaining({ code: 'CONTINUATION_STALE' }))
+    expect(() => inspect(complete, join(canonicalRoot, 'other')))
+      .toThrowError(expect.objectContaining({ code: 'CONTINUATION_STALE' }))
+    const badTurn = structuredClone(complete); badTurn[2].data.turn = 2
+    expect(() => inspect(badTurn)).toThrowError(expect.objectContaining({ code: 'CONTINUATION_STALE' }))
+
+    const reasoning = structuredClone(complete)
+    reasoning[1].data.chunk = { type: 'reasoning-delta', index: 0, text: 'private chain of thought' }
+    expect(() => inspect(reasoning)).toThrowError(expect.objectContaining({ code: 'RAW_REASONING_EXPOSED' }))
+    const thinking = structuredClone(complete)
+    thinking[1] = {
+      type: 'assistant/message', seq: 1, time: 3,
+      data: { turn: 1, step: 1, message: { role: 'assistant', content: [
+        { type: 'thinking', thinking: 'private', signature: 'opaque' },
+      ] } },
+    }
+    expect(() => inspect(thinking)).toThrowError(expect.objectContaining({ code: 'RAW_REASONING_EXPOSED' }))
+    const requestReasoning = structuredClone(complete)
+    requestReasoning[1] = {
+      type: 'request/header', seq: 1, time: 3,
+      data: { turn: 1, step: 1, header: { tools: [], reasoning_content: 'private' } },
+    }
+    expect(() => inspect(requestReasoning))
+      .toThrowError(expect.objectContaining({ code: 'RAW_REASONING_EXPOSED' }))
   })
 
   it('keeps first payload read and validation inside the sandboxed branch', async () => {
@@ -517,7 +810,7 @@ describe('hardened FDE one-shot Harness sidecar', () => {
     const parent = await tempRoot('marker-injection')
     const sessionRoot = join(parent, 'session')
     const execution = await execa(process.execPath, [
-      join(sidecarRoot, 'sidecar.mjs'), '--session-root', sessionRoot,
+      join(sidecarRoot, 'sidecar.mjs'), '--start-session-root', sessionRoot,
     ], {
       input: `${JSON.stringify(await fixture())}\n`,
       env: { FDE_ADAPTER_SANDBOXED: '1' },
@@ -539,7 +832,7 @@ describe('hardened FDE one-shot Harness sidecar', () => {
     const { mkdir } = await import('node:fs/promises')
     await mkdir(leaf, { mode: 0o700 })
     await expect(execa(process.execPath, [
-      join(sidecarRoot, 'sidecar.mjs'), '--session-root', leaf,
+      join(sidecarRoot, 'sidecar.mjs'), '--start-session-root', leaf,
     ], { input: `${JSON.stringify(await fixture())}\n`, timeout: 5_000 }))
       .rejects.toMatchObject({ exitCode: 2 })
   })

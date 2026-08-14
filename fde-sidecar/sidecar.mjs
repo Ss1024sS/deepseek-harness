@@ -2,9 +2,11 @@
 
 import { spawn } from 'node:child_process'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { chmod, lstat, mkdir, readFile, readdir, realpath, stat, unlink } from 'node:fs/promises'
+import { fstat as fstatCallback } from 'node:fs'
+import { chmod, lstat, mkdir, open, readFile, readdir, realpath, unlink } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { promisify } from 'node:util'
 
 const UPSTREAM_COMMIT = '47f943859bef60e4160492346772ded9b24f765a'
 const REQUEST_KIND = 'effiengine.fde-harness-sidecar-request'
@@ -13,7 +15,7 @@ const RECEIPT_KIND = 'effiengine.fde-harness-advice-receipt'
 const ADVICE_KIND = 'effiengine.fde-harness-advice'
 const ERROR_KIND = 'effiengine.fde-harness-sidecar-error'
 const SERVER_NAME = 'deepseek-harness-sdk-runtime'
-const SERVER_VERSION = '0.0.1'
+const SERVER_VERSION = '0.0.2'
 const MAX_INPUT_LINE_BYTES = 64 * 1024
 const MAX_FRAME_BYTES = 64 * 1024
 const MAX_FRAMES = 128
@@ -28,6 +30,9 @@ const MAX_ACTION_TEXT_CODE_POINTS = 300
 const MAX_ACTIONS = 8
 const MAX_RUNTIME_CLOSURE_FILES = 2_048
 const MAX_RUNTIME_CLOSURE_BYTES = 32 * 1024 * 1024
+const EMPTY_EVENT_DIGEST = 'sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+const SESSION_LOCK_FD = 3
+const fstatAsync = promisify(fstatCallback)
 
 const labRoot = fileURLToPath(new URL('../', import.meta.url))
 const sidecarRoot = join(labRoot, 'fde-sidecar')
@@ -89,6 +94,10 @@ const ALLOWED_EVENT_TYPES = new Set([
   'session/title', 'request/header', 'request/context', 'assistant/chunk',
   'assistant/message', 'step/end', 'turn/end',
 ])
+const ALLOWED_DURABLE_EVENT_TYPES = new Set([...ALLOWED_EVENT_TYPES, 'session/end-seed'])
+const SAFE_ASSISTANT_CHUNK_TYPES = new Set([
+  'block-start', 'text-delta', 'block-end', 'usage', 'finish',
+])
 const ERROR_CODES = new Set([
   'INVALID_REQUEST', 'DIGEST_MISMATCH', 'INPUT_TOO_LARGE', 'MULTIPLE_REQUESTS',
   'MANIFEST_INVALID', 'MANIFEST_DRIFT', 'PLATFORM_UNSUPPORTED', 'SANDBOX_FAILURE',
@@ -96,7 +105,7 @@ const ERROR_CODES = new Set([
   'FRAME_LIMIT_EXCEEDED', 'OUTPUT_LIMIT_EXCEEDED', 'STDERR_LIMIT_EXCEEDED',
   'PROTOCOL_VIOLATION', 'UNKNOWN_NOTIFICATION', 'UNKNOWN_EVENT', 'TOOLS_EXPOSED',
   'AMBIGUOUS_RESULT', 'INVALID_MODEL_OUTPUT', 'PERSISTENCE_NOT_PROVEN',
-  'CLEANUP_FAILED', 'SIDECAR_FAILURE',
+  'CONTINUATION_STALE', 'SESSION_BUSY', 'RAW_REASONING_EXPOSED', 'CLEANUP_FAILED', 'SIDECAR_FAILURE',
 ])
 
 export class SidecarError extends Error {
@@ -276,7 +285,7 @@ export function validateRequest(value) {
   const payload = validatePayload(wrapper.payload)
   const payloadCanonical = canonicalJson(payload)
   if (sha256(payloadCanonical) !== wrapper.outgoingDigest) throw new SidecarError('DIGEST_MISMATCH')
-  return { outgoingDigest: wrapper.outgoingDigest, payloadCanonical }
+  return { outgoingDigest: wrapper.outgoingDigest, payloadCanonical, payloadSchemaVersion: payload.schemaVersion }
 }
 
 function safeText(value, maxCharacters) {
@@ -631,6 +640,45 @@ export class BoundedJsonRpcClient {
   }
 }
 
+const RAW_REASONING_KEYS = new Set([
+  'reasoning', 'reasoning_content', 'thinking', 'signature', 'encrypted_content',
+])
+const RAW_REASONING_TYPES = new Set([
+  'reasoning', 'reasoning-delta', 'thinking', 'redacted_thinking',
+])
+
+function rejectRawReasoningValue(value) {
+  if (Array.isArray(value)) {
+    for (const item of value) rejectRawReasoningValue(item)
+    return
+  }
+  if (value === null || typeof value !== 'object') return
+  for (const [key, item] of Object.entries(value)) {
+    if (RAW_REASONING_KEYS.has(key)
+      || key === 'type' && RAW_REASONING_TYPES.has(item)
+      || key === 'blockType' && RAW_REASONING_TYPES.has(item)) {
+      throw new SidecarError('RAW_REASONING_EXPOSED')
+    }
+    rejectRawReasoningValue(item)
+  }
+}
+
+function validateEventSafety(event) {
+  if (event.type === 'tool/call' || event.type === 'tool/result') throw new SidecarError('TOOLS_EXPOSED')
+  rejectRawReasoningValue(event.data)
+  if (event.type !== 'assistant/chunk') return
+  const data = record(event.data)
+  const chunk = record(data.chunk)
+  if (chunk.type === 'tool-call-delta') throw new SidecarError('TOOLS_EXPOSED')
+  if (!SAFE_ASSISTANT_CHUNK_TYPES.has(chunk.type)) throw new SidecarError('PROTOCOL_VIOLATION')
+  if (chunk.type === 'block-start' && chunk.blockType !== 'text') {
+    throw new SidecarError('PROTOCOL_VIOLATION')
+  }
+  if (chunk.type === 'block-end' && chunk.block?.type !== 'text') {
+    throw new SidecarError('PROTOCOL_VIOLATION')
+  }
+}
+
 function eventFrom(notification, sessionId) {
   if (notification.method !== 'session.event') return undefined
   const params = record(notification.params)
@@ -638,8 +686,8 @@ function eventFrom(notification, sessionId) {
   exactKeys(params, ['sessionId', 'event'], 'PROTOCOL_VIOLATION')
   const event = record(params.event)
   if (typeof event.type !== 'string') throw new SidecarError('PROTOCOL_VIOLATION')
-  if (event.type === 'tool/call' || event.type === 'tool/result') throw new SidecarError('TOOLS_EXPOSED')
   if (!ALLOWED_EVENT_TYPES.has(event.type)) throw new SidecarError('UNKNOWN_EVENT')
+  validateEventSafety(event)
   return event
 }
 
@@ -649,7 +697,7 @@ function matchingReceipt(event, messageId) {
     && event.data.inserted.some(message => message?.id === messageId)
 }
 
-function verifyEvents(events, messageId, payloadCanonical) {
+function verifyEvents(events, messageId, payloadCanonical, { expectedTurn, expectedFirstSeq }) {
   const matchingReceipts = events.filter(event => matchingReceipt(event, messageId))
   const userMessages = events.filter(event => event.type === 'user/message')
   const assistants = events.filter(event => event.type === 'assistant/message')
@@ -661,7 +709,12 @@ function verifyEvents(events, messageId, payloadCanonical) {
     || turnStarts.length !== 1 || turnEnds.length !== 1 || toolEvents.length !== 0) {
     throw new SidecarError(toolEvents.length > 0 ? 'TOOLS_EXPOSED' : 'AMBIGUOUS_RESULT')
   }
-  if (turnEnds[0].data?.turn !== turnStarts[0].data?.turn || turnEnds[0].data?.reason?.kind !== 'completed') {
+  for (let index = 0; index < events.length; index += 1) {
+    if (events[index]?.seq !== expectedFirstSeq + index) throw new SidecarError('CONTINUATION_STALE')
+  }
+  if (turnStarts[0].data?.turn !== expectedTurn
+    || turnEnds[0].data?.turn !== expectedTurn
+    || turnEnds[0].data?.reason?.kind !== 'completed') {
     throw new SidecarError('AMBIGUOUS_RESULT')
   }
   for (const header of headers) {
@@ -693,26 +746,67 @@ async function findSessionLog(sessionRoot) {
   return found[0]
 }
 
-export function verifyDurableSession(logText, { sessionId, sessionRoot, expectedEvents }) {
+export function inspectDurableSession(logText, { sessionRoot }) {
   let rows
   try { rows = logText.trimEnd().split('\n').map(line => JSON.parse(line)) } catch {
-    throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+    throw new SidecarError('CONTINUATION_STALE')
   }
-  if (rows.length < 2) throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+  if (rows.length < 2) throw new SidecarError('CONTINUATION_STALE')
   const header = record(rows[0])
-  exactKeys(header, ['type', 'version', 'id', 'createdAt', 'cwd', 'delegationDepth'], 'PERSISTENCE_NOT_PROVEN')
-  if (header.type !== 'session' || header.version !== 0 || header.id !== sessionId
+  exactKeys(header, ['type', 'version', 'id', 'createdAt', 'cwd', 'delegationDepth'], 'CONTINUATION_STALE')
+  if (header.type !== 'session' || header.version !== 0
+    || typeof header.id !== 'string' || header.id === ''
     || header.cwd !== sessionRoot || header.delegationDepth !== 0
     || !Number.isSafeInteger(header.createdAt) || header.createdAt < 0) {
-    throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+    throw new SidecarError('CONTINUATION_STALE')
   }
   const persisted = rows.slice(1)
+  let openTurn
+  let completedTurn = 0
   for (let index = 0; index < persisted.length; index += 1) {
     const event = record(persisted[index])
-    if (event.type === 'tool/call' || event.type === 'tool/result') throw new SidecarError('TOOLS_EXPOSED')
-    if (!ALLOWED_EVENT_TYPES.has(event.type)) throw new SidecarError('UNKNOWN_EVENT')
-    if (event.seq !== index) throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+    validateEventSafety(event)
+    if (!ALLOWED_DURABLE_EVENT_TYPES.has(event.type)) throw new SidecarError('UNKNOWN_EVENT')
+    if (event.seq !== index) throw new SidecarError('CONTINUATION_STALE')
+    if (event.type === 'session/end-seed') {
+      const data = record(event.data)
+      exactKeys(data, [], 'CONTINUATION_STALE')
+      if (openTurn !== undefined) throw new SidecarError('CONTINUATION_STALE')
+    } else if (event.type === 'turn/start') {
+      const turn = event.data?.turn
+      if (openTurn !== undefined || turn !== completedTurn + 1) throw new SidecarError('CONTINUATION_STALE')
+      openTurn = turn
+    } else if (event.type === 'turn/end') {
+      const turn = event.data?.turn
+      if (openTurn !== turn || event.data?.reason?.kind !== 'completed') {
+        throw new SidecarError('CONTINUATION_STALE')
+      }
+      completedTurn = turn
+      openTurn = undefined
+    }
   }
+  if (openTurn !== undefined || completedTurn === 0
+    || persisted.at(-1)?.type !== 'turn/end') throw new SidecarError('CONTINUATION_STALE')
+  return {
+    header,
+    sessionIdentityDigest: sha256(canonicalJson(header)),
+    persisted,
+    eventCount: persisted.length,
+    lastEventSeq: persisted.length - 1,
+    completedTurn,
+    eventDigest: sha256(persisted.map(event => canonicalJson(event)).join('\n')),
+  }
+}
+
+export function verifyDurableSession(logText, { sessionId, sessionRoot, expectedEvents }) {
+  let inspected
+  try { inspected = inspectDurableSession(logText, { sessionRoot }) } catch (error) {
+    if (error instanceof SidecarError
+      && ['TOOLS_EXPOSED', 'RAW_REASONING_EXPOSED', 'UNKNOWN_EVENT'].includes(error.code)) throw error
+    throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+  }
+  if (inspected.header.id !== sessionId) throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+  const persisted = inspected.persisted
   if (persisted.length !== expectedEvents.length) throw new SidecarError('PERSISTENCE_NOT_PROVEN')
   for (let index = 0; index < persisted.length; index += 1) {
     if (canonicalJson(persisted[index]) !== canonicalJson(expectedEvents[index])) {
@@ -724,7 +818,7 @@ export function verifyDurableSession(logText, { sessionId, sessionRoot, expected
 
 async function ensurePrivateDirectory(path, create) {
   if (create) await mkdir(path, { recursive: false, mode: 0o700 })
-  const info = await stat(path)
+  const info = await lstat(path)
   if (!info.isDirectory() || (info.mode & 0o077) !== 0) throw new SidecarError('SANDBOX_FAILURE')
   return realpath(path)
 }
@@ -747,19 +841,44 @@ export class FdeHarnessSidecar {
     this.clientFactory = options.clientFactory
     this.precreatedRoots = options.precreatedRoots ?? false
     this.effectiveProfileDigest = options.effectiveProfileDigest
+    this.sessionMode = options.sessionMode ?? 'start'
+    this.expectedEventCount = options.expectedEventCount ?? 0
+    this.expectedEventDigest = options.expectedEventDigest ?? EMPTY_EVENT_DIGEST
+    this.expectedSessionIdentityDigest = options.expectedSessionIdentityDigest ?? null
   }
 
   async analyze(rawRequest) {
     if (process.platform !== 'darwin') throw new SidecarError('PLATFORM_UNSUPPORTED')
     await proveSandboxActive()
-    const { outgoingDigest, payloadCanonical } = validateRequest(rawRequest)
+    const { outgoingDigest, payloadCanonical, payloadSchemaVersion } = validateRequest(rawRequest)
+    if (this.sessionMode === 'resume' && payloadSchemaVersion !== 2) {
+      throw new SidecarError('INVALID_REQUEST')
+    }
     const verified = await verifyRuntimeManifest({ manifestPath: this.manifestPath })
     if (!/^sha256:[0-9a-f]{64}$/.test(this.effectiveProfileDigest ?? '')) {
       throw new SidecarError('SANDBOX_FAILURE')
     }
-    const sessionId = `fde-${randomUUID()}`
     await ensurePrivateDirectory(this.runRoot, !this.precreatedRoots)
     await ensurePrivateDirectory(this.sessionRoot, !this.precreatedRoots)
+    const canonicalSessionRoot = await realpath(this.sessionRoot)
+    let sessionId = `fde-${randomUUID()}`
+    let prior = {
+      persisted: [], eventCount: 0, lastEventSeq: -1, completedTurn: 0,
+      eventDigest: EMPTY_EVENT_DIGEST,
+    }
+    if (this.sessionMode === 'resume') {
+      let logText
+      try { logText = await readFile(await findSessionLog(this.sessionRoot), 'utf8') } catch {
+        throw new SidecarError('CONTINUATION_STALE')
+      }
+      prior = inspectDurableSession(logText, { sessionRoot: canonicalSessionRoot })
+      if (prior.eventCount !== this.expectedEventCount
+        || prior.eventDigest !== this.expectedEventDigest
+        || prior.sessionIdentityDigest !== this.expectedSessionIdentityDigest) {
+        throw new SidecarError('CONTINUATION_STALE')
+      }
+      sessionId = prior.header.id
+    }
     const runtimeTmp = join(this.runRoot, 'runtime-tmp')
     await mkdir(runtimeTmp, { mode: 0o700 })
     const bootstrapRoot = join(this.runRoot, 'bootstrap')
@@ -771,7 +890,7 @@ export class FdeHarnessSidecar {
       nodePath: verified.nodePath,
       runtimePath: verified.paths.runtimeArtifact,
       configPath: verified.paths.config,
-      sessionRoot: await realpath(this.sessionRoot),
+      sessionRoot: canonicalSessionRoot,
       runtimeTmp: await realpath(runtimeTmp),
       bootstrapRoot: await realpath(bootstrapRoot),
       replayFile: verified.paths.replaySession,
@@ -791,6 +910,16 @@ export class FdeHarnessSidecar {
         throw new SidecarError('PROTOCOL_VIOLATION')
       }
       const turnDeadline = Date.now() + TURN_TIMEOUT_MS
+      let expectedFirstSeq = 0
+      if (this.sessionMode === 'resume') {
+        const resumed = await client.request('session/resume', { sessionId }, turnDeadline, 'TURN_TIMEOUT')
+        const value = record(resumed)
+        exactKeys(value, ['sessionId', 'durablePrefixCount', 'nextSeq'], 'PROTOCOL_VIOLATION')
+        if (value.sessionId !== sessionId
+          || value.durablePrefixCount !== prior.eventCount
+          || value.nextSeq !== prior.eventCount + 1) throw new SidecarError('CONTINUATION_STALE')
+        expectedFirstSeq = value.nextSeq
+      }
       const prompt = await client.request('session/prompt', {
         sessionId,
         contentBlocks: [{ type: 'text', text: payloadCanonical }],
@@ -810,7 +939,10 @@ export class FdeHarnessSidecar {
         const event = eventFrom(notification, sessionId)
         if (event !== undefined) events.push(event)
       }
-      const suggestion = verifyEvents(events, prompt.messageId, payloadCanonical)
+      const suggestion = verifyEvents(events, prompt.messageId, payloadCanonical, {
+        expectedTurn: prior.completedTurn + 1,
+        expectedFirstSeq,
+      })
       result = { suggestion }
     } catch (error) {
       failure = error instanceof SidecarError ? error : new SidecarError('SIDECAR_FAILURE')
@@ -830,13 +962,34 @@ export class FdeHarnessSidecar {
     if (logText.includes(REQUEST_KIND) || logText.includes(outgoingDigest)) {
       throw new SidecarError('PERSISTENCE_NOT_PROVEN')
     }
-    const persisted = verifyDurableSession(logText, {
-      sessionId,
-      sessionRoot: await realpath(this.sessionRoot),
-      expectedEvents: events,
-    })
-    if (persisted.length === 0 || persisted[persisted.length - 1]?.type !== 'turn/end'
-      || persisted[persisted.length - 1]?.data?.reason?.kind !== 'completed') {
+    let finalInspection
+    if (this.sessionMode === 'start') {
+      const persisted = verifyDurableSession(logText, {
+        sessionId, sessionRoot: canonicalSessionRoot, expectedEvents: events,
+      })
+      finalInspection = inspectDurableSession(logText, { sessionRoot: canonicalSessionRoot })
+      if (persisted.length !== finalInspection.eventCount) throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+    } else {
+      finalInspection = inspectDurableSession(logText, { sessionRoot: canonicalSessionRoot })
+      if (finalInspection.header.id !== sessionId
+        || finalInspection.eventCount !== prior.eventCount + 1 + events.length) {
+        throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+      }
+      for (let index = 0; index < prior.persisted.length; index += 1) {
+        if (canonicalJson(finalInspection.persisted[index]) !== canonicalJson(prior.persisted[index])) {
+          throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+        }
+      }
+      const marker = finalInspection.persisted[prior.eventCount]
+      if (marker?.type !== 'session/end-seed' || marker.seq !== prior.eventCount
+        || canonicalJson(marker.data) !== '{}') throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+      for (let index = 0; index < events.length; index += 1) {
+        if (canonicalJson(finalInspection.persisted[prior.eventCount + 1 + index]) !== canonicalJson(events[index])) {
+          throw new SidecarError('PERSISTENCE_NOT_PROVEN')
+        }
+      }
+    }
+    if (finalInspection.completedTurn !== prior.completedTurn + 1) {
       throw new SidecarError('PERSISTENCE_NOT_PROVEN')
     }
     const manifest = verified.manifest
@@ -863,8 +1016,16 @@ export class FdeHarnessSidecar {
       outcome: { status: 'COMPLETED', suggestion: result.suggestion },
       evidence: {
         inputDigest: outgoingDigest,
-        eventDigest: sha256(persisted.map(event => canonicalJson(event)).join('\n')),
-        eventCount: persisted.length,
+        resumeMode: this.sessionMode === 'start' ? 'STARTED' : 'RESUMED',
+        priorEventDigest: prior.eventDigest,
+        priorEventCount: prior.eventCount,
+        eventDigest: finalInspection.eventDigest,
+        eventCount: finalInspection.eventCount,
+        lastEventSeq: finalInspection.lastEventSeq,
+        completedTurn: finalInspection.completedTurn,
+        sessionIdentityDigest: finalInspection.sessionIdentityDigest,
+        providerContinuationDigest: null,
+        rawReasoningPersisted: false,
         toolCallCount: 0,
       },
       authority: 'ADVISORY_ONLY',
@@ -872,18 +1033,110 @@ export class FdeHarnessSidecar {
   }
 }
 
-function parseCliArgs(argv) {
-  if (argv.length !== 2 || argv[0] !== '--session-root' || typeof argv[1] !== 'string') {
-    throw new SidecarError('INVALID_REQUEST')
+export function sessionLockPathFor(sessionRoot) {
+  return `${resolve(sessionRoot)}.fde-session.lock`
+}
+
+function safeSessionLockMetadata(metadata) {
+  return metadata.isFile()
+    && metadata.nlink === 1n
+    && (metadata.mode & 0o177n) === 0n
+    && (process.getuid?.() === undefined || metadata.uid === BigInt(process.getuid()))
+}
+
+async function acquireSessionLock(sessionRoot) {
+  const path = sessionLockPathFor(sessionRoot)
+  let handle
+  try {
+    handle = await open(path, 'wx', 0o600)
+  } catch (error) {
+    if (error?.code === 'EEXIST') throw new SidecarError('SESSION_BUSY')
+    throw new SidecarError('SANDBOX_FAILURE')
   }
-  const sessionRoot = resolve(argv[1])
-  return { sessionRoot, runRoot: join(dirname(sessionRoot), `run-${randomUUID()}`) }
+  try {
+    const metadata = await handle.stat({ bigint: true })
+    if (!safeSessionLockMetadata(metadata)) throw new SidecarError('SANDBOX_FAILURE')
+    return {
+      handle,
+      path: await realpath(path),
+      device: String(metadata.dev),
+      inode: String(metadata.ino),
+    }
+  } catch (error) {
+    await handle.close().catch(() => {})
+    await unlink(path).catch(() => {})
+    if (error instanceof SidecarError) throw error
+    throw new SidecarError('SANDBOX_FAILURE')
+  }
+}
+
+async function releaseSessionLock(lock) {
+  let failure
+  try {
+    const metadata = await lstat(lock.path, { bigint: true })
+    if (!safeSessionLockMetadata(metadata)
+      || String(metadata.dev) !== lock.device
+      || String(metadata.ino) !== lock.inode) throw new SidecarError('CLEANUP_FAILED')
+    await unlink(lock.path)
+  } catch (error) {
+    failure = error instanceof SidecarError ? error : new SidecarError('CLEANUP_FAILED')
+  }
+  try { await lock.handle.close() } catch { failure ??= new SidecarError('CLEANUP_FAILED') }
+  if (failure !== undefined) throw failure
+}
+
+function parseCliArgs(argv) {
+  if (argv.length === 2 && argv[0] === '--start-session-root' && typeof argv[1] === 'string') {
+    const sessionRoot = resolve(argv[1])
+    return {
+      sessionMode: 'start', sessionRoot, runRoot: join(dirname(sessionRoot), `run-${randomUUID()}`),
+      expectedEventCount: 0, expectedEventDigest: EMPTY_EVENT_DIGEST,
+      expectedSessionIdentityDigest: null,
+    }
+  }
+  if (argv.length === 8 && argv[0] === '--resume-session-root'
+    && argv[2] === '--expected-event-count' && argv[4] === '--expected-event-digest'
+    && argv[6] === '--expected-session-identity-digest') {
+    const expectedEventCount = Number(argv[3])
+    if (!Number.isSafeInteger(expectedEventCount) || expectedEventCount <= 0
+      || String(expectedEventCount) !== argv[3]
+      || !/^sha256:[0-9a-f]{64}$/.test(argv[5])
+      || !/^sha256:[0-9a-f]{64}$/.test(argv[7])) throw new SidecarError('INVALID_REQUEST')
+    const sessionRoot = resolve(argv[1])
+    return {
+      sessionMode: 'resume', sessionRoot, runRoot: join(dirname(sessionRoot), `run-${randomUUID()}`),
+      expectedEventCount, expectedEventDigest: argv[5], expectedSessionIdentityDigest: argv[7],
+    }
+  }
+  throw new SidecarError('INVALID_REQUEST')
 }
 
 function parseInternalCliArgs(argv) {
-  if (argv.length !== 6 || argv[0] !== '--internal-session-root' || argv[2] !== '--internal-run-root'
-    || argv[4] !== '--manifest') throw new SidecarError('INVALID_REQUEST')
-  return { sessionRoot: resolve(argv[1]), runRoot: resolve(argv[3]), manifestPath: resolve(argv[5]) }
+  if (argv.length !== 16 || argv[0] !== '--internal-session-mode'
+    || !['start', 'resume'].includes(argv[1])
+    || argv[2] !== '--internal-session-root' || argv[4] !== '--internal-run-root'
+    || argv[6] !== '--manifest' || argv[8] !== '--expected-event-count'
+    || argv[10] !== '--expected-event-digest'
+    || argv[12] !== '--expected-session-identity-digest'
+    || argv[14] !== '--session-lock-fd') throw new SidecarError('INVALID_REQUEST')
+  const expectedEventCount = Number(argv[9])
+  const expectedSessionIdentityDigest = argv[13] === 'null' ? null : argv[13]
+  const sessionLockFd = Number(argv[15])
+  if (!Number.isSafeInteger(expectedEventCount) || expectedEventCount < 0
+    || String(expectedEventCount) !== argv[9]
+    || !/^sha256:[0-9a-f]{64}$/.test(argv[11])
+    || expectedSessionIdentityDigest !== null && !/^sha256:[0-9a-f]{64}$/.test(expectedSessionIdentityDigest)
+    || sessionLockFd !== SESSION_LOCK_FD || String(sessionLockFd) !== argv[15]
+    || argv[1] === 'start' && (expectedEventCount !== 0
+      || argv[11] !== EMPTY_EVENT_DIGEST || expectedSessionIdentityDigest !== null)
+    || argv[1] === 'resume' && (expectedEventCount <= 0 || expectedSessionIdentityDigest === null)) {
+    throw new SidecarError('INVALID_REQUEST')
+  }
+  return {
+    sessionMode: argv[1], sessionRoot: resolve(argv[3]), runRoot: resolve(argv[5]),
+    manifestPath: resolve(argv[7]), expectedEventCount, expectedEventDigest: argv[11],
+    expectedSessionIdentityDigest, sessionLockFd,
+  }
 }
 
 export async function verifyInternalLaunchProof(args, nonce) {
@@ -898,13 +1151,35 @@ export async function verifyInternalLaunchProof(args, nonce) {
   const value = record(proof)
   exactKeys(value, [
     'schemaVersion', 'kind', 'nonceDigest', 'sessionRoot', 'runRoot', 'manifestDigest',
-    'adapterTemplateDigest', 'effectiveProfileDigest',
+    'adapterTemplateDigest', 'effectiveProfileDigest', 'sessionMode',
+    'expectedEventCount', 'expectedEventDigest', 'expectedSessionIdentityDigest',
+    'sessionLockPath', 'sessionLockFd', 'sessionLockDevice', 'sessionLockInode',
   ], 'SANDBOX_FAILURE')
   const effectiveProfileDigest = sha256(await readFile(join(args.runRoot, 'adapter.generated.sb')))
+  let lockMetadata
+  try { lockMetadata = await fstatAsync(args.sessionLockFd, { bigint: true }) } catch {
+    throw new SidecarError('SANDBOX_FAILURE')
+  }
+  const expectedLockPath = await realpath(sessionLockPathFor(args.sessionRoot))
+  const lockPathMetadata = await lstat(expectedLockPath, { bigint: true })
   if (value.schemaVersion !== 1 || value.kind !== 'effiengine.fde-harness-launch-proof'
     || value.nonceDigest !== sha256(nonce)
     || value.sessionRoot !== await realpath(args.sessionRoot)
     || value.runRoot !== await realpath(args.runRoot)
+    || value.sessionMode !== args.sessionMode
+    || value.expectedEventCount !== args.expectedEventCount
+    || value.expectedEventDigest !== args.expectedEventDigest
+    || value.expectedSessionIdentityDigest !== args.expectedSessionIdentityDigest
+    || value.sessionLockPath !== expectedLockPath
+    || value.sessionLockFd !== args.sessionLockFd
+    || !/^[0-9]+$/.test(value.sessionLockDevice)
+    || !/^[0-9]+$/.test(value.sessionLockInode)
+    || !safeSessionLockMetadata(lockMetadata)
+    || !safeSessionLockMetadata(lockPathMetadata)
+    || String(lockMetadata.dev) !== value.sessionLockDevice
+    || String(lockMetadata.ino) !== value.sessionLockInode
+    || String(lockPathMetadata.dev) !== value.sessionLockDevice
+    || String(lockPathMetadata.ino) !== value.sessionLockInode
     || value.manifestDigest !== `sha256:${verified.manifestDigest}`
     || value.adapterTemplateDigest !== `sha256:${verified.manifest.adapterProfile.sha256}`
     || value.effectiveProfileDigest !== effectiveProfileDigest) {
@@ -914,11 +1189,13 @@ export async function verifyInternalLaunchProof(args, nonce) {
   return effectiveProfileDigest
 }
 
-async function launchSandboxedAdapter({ sessionRoot, runRoot }) {
-  if (process.platform !== 'darwin') throw new SidecarError('PLATFORM_UNSUPPORTED')
+async function launchSandboxedAdapterLocked({
+  sessionMode, sessionRoot, runRoot, expectedEventCount, expectedEventDigest,
+  expectedSessionIdentityDigest,
+}, sessionLock) {
   const verified = await verifyRuntimeManifest()
   await ensurePrivateDirectory(runRoot, true)
-  await ensurePrivateDirectory(sessionRoot, true)
+  await ensurePrivateDirectory(sessionRoot, sessionMode === 'start')
   const profileTemplate = await readFile(verified.paths.adapterProfile, 'utf8')
   const profile = replaceProfileParameters(profileTemplate, {
     NODE_PATH: verified.nodePath,
@@ -926,6 +1203,7 @@ async function launchSandboxedAdapter({ sessionRoot, runRoot }) {
     PRIVATE_PARENT: await realpath(dirname(runRoot)),
     RUN_ROOT: await realpath(runRoot),
     SESSION_ROOT: await realpath(sessionRoot),
+    SESSION_LOCK_PATH: sessionLock.path,
   })
   const profilePath = join(runRoot, 'adapter.generated.sb')
   await writePrivateFile(profilePath, profile)
@@ -940,6 +1218,14 @@ async function launchSandboxedAdapter({ sessionRoot, runRoot }) {
     manifestDigest: `sha256:${verified.manifestDigest}`,
     adapterTemplateDigest: `sha256:${verified.manifest.adapterProfile.sha256}`,
     effectiveProfileDigest,
+    sessionMode,
+    expectedEventCount,
+    expectedEventDigest,
+    expectedSessionIdentityDigest,
+    sessionLockPath: sessionLock.path,
+    sessionLockFd: SESSION_LOCK_FD,
+    sessionLockDevice: sessionLock.device,
+    sessionLockInode: sessionLock.inode,
   }
   await writePrivateFile(join(runRoot, 'launcher.proof'), `${canonicalJson(proof)}\n`)
   const env = {
@@ -952,10 +1238,15 @@ async function launchSandboxedAdapter({ sessionRoot, runRoot }) {
   const child = spawn('/usr/bin/sandbox-exec', [
     '-f', profilePath,
     verified.nodePath, verified.paths.sidecar,
+    '--internal-session-mode', sessionMode,
     '--internal-session-root', await realpath(sessionRoot),
     '--internal-run-root', await realpath(runRoot),
     '--manifest', await realpath(defaults.manifest),
-  ], { cwd: runRoot, env, stdio: ['inherit', 'pipe', 'ignore'] })
+    '--expected-event-count', String(expectedEventCount),
+    '--expected-event-digest', expectedEventDigest,
+    '--expected-session-identity-digest', expectedSessionIdentityDigest ?? 'null',
+    '--session-lock-fd', String(SESSION_LOCK_FD),
+  ], { cwd: runRoot, env, stdio: ['inherit', 'pipe', 'ignore', sessionLock.handle.fd] })
   const chunks = []
   let total = 0
   let overflow = false
@@ -976,8 +1267,21 @@ async function launchSandboxedAdapter({ sessionRoot, runRoot }) {
   if (overflow || result.signal !== null || ![0, 2].includes(result.code)
     || output.length === 0 || output.indexOf(0x0a) !== output.length - 1
     || output.subarray(0, output.length - 1).includes(0x0a)) throw new SidecarError('SANDBOX_FAILURE')
-  process.stdout.write(output)
-  process.exitCode = result.code
+  return { output, exitCode: result.code }
+}
+
+async function launchSandboxedAdapter(args) {
+  if (process.platform !== 'darwin') throw new SidecarError('PLATFORM_UNSUPPORTED')
+  await ensurePrivateDirectory(dirname(args.sessionRoot), false)
+  const sessionLock = await acquireSessionLock(args.sessionRoot)
+  let execution
+  try {
+    execution = await launchSandboxedAdapterLocked(args, sessionLock)
+  } finally {
+    await releaseSessionLock(sessionLock)
+  }
+  process.stdout.write(execution.output)
+  process.exitCode = execution.exitCode
 }
 
 async function readSingleInputLine() {
@@ -1005,7 +1309,7 @@ export function errorReceipt(error) {
 
 async function main() {
   try {
-    const internalArgs = process.argv[2] === '--internal-session-root'
+    const internalArgs = process.argv[2] === '--internal-session-mode'
     if (internalArgs) {
       if (process.env.FDE_ADAPTER_SANDBOXED !== '1') throw new SidecarError('SANDBOX_FAILURE')
       const args = parseInternalCliArgs(process.argv.slice(2))

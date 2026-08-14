@@ -3,8 +3,8 @@
     "kind": "chunks",
     "chunks": [
       { "type": "block-start", "index": 0, "blockType": "text" },
-      { "type": "text-delta", "index": 0, "text": "{\"schemaVersion\":1,\"kind\":\"effiengine.fde-harness-advice\",\"verdict\":\"MANUAL_REVIEW\",\"summary\":\"虚构汇总中存在两个配置缺口，保持草稿态并人工复核。\",\"actions\":[{\"priority\":\"P1\",\"text\":\"只核对去标识化汇总中的配置缺口。\"}]}" },
-      { "type": "block-end", "index": 0, "block": { "type": "text", "text": "{\"schemaVersion\":1,\"kind\":\"effiengine.fde-harness-advice\",\"verdict\":\"MANUAL_REVIEW\",\"summary\":\"虚构汇总中存在两个配置缺口，保持草稿态并人工复核。\",\"actions\":[{\"priority\":\"P1\",\"text\":\"只核对去标识化汇总中的配置缺口。\"}]}" } },
+      { "type": "text-delta", "index": 0, "text": "{\"schemaVersion\":1,\"kind\":\"effiengine.fde-harness-advice\",\"verdict\":\"MANUAL_REVIEW\",\"summary\":\"历史能力缺口={{fromRequest:\\\"capabilityGaps\\\":(2)}}\",\"actions\":[{\"priority\":\"P1\",\"text\":\"只核对去标识化汇总中的配置缺口。\"}]}" },
+      { "type": "block-end", "index": 0, "block": { "type": "text", "text": "{\"schemaVersion\":1,\"kind\":\"effiengine.fde-harness-advice\",\"verdict\":\"MANUAL_REVIEW\",\"summary\":\"历史能力缺口={{fromRequest:\\\"capabilityGaps\\\":(2)}}\",\"actions\":[{\"priority\":\"P1\",\"text\":\"只核对去标识化汇总中的配置缺口。\"}]}" } },
       { "type": "usage", "usage": { "inputTokens": 128, "outputTokens": 64, "cacheReadTokens": 0 } },
       { "type": "finish", "reason": { "kind": "stop" } }
     ]

@@ -109,6 +109,145 @@ async function settleSubagent(
 }
 
 describe('HarnessSdkJsonRpcServer', () => {
+  it('resumes one persisted Session explicitly and reports its durable prefix cursor', async () => {
+    const session = {
+      id: SessionId('resumed'),
+      header: { cwd: process.cwd() },
+      firstLiveSeq: 17,
+      seq: 18,
+    }
+    const agent = ({ id: session.id, session }) as unknown as Agent
+    const handle = { agent, dispose: vi.fn(() => Promise.resolve()) }
+    const resume = vi.fn(async () => handle)
+    const create = vi.fn()
+    const ctx = {
+      on: vi.fn(() => () => undefined),
+      agents: { resume, create, get: (id: SessionId) => String(id) === 'resumed' ? agent : undefined },
+      get: () => ({ listProviders: () => [{ id: 'deepseek-official', name: 'DeepSeek' }] }),
+    } as unknown as Context
+    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
+    await server.initialize({
+      cwd: process.cwd(), provider: 'deepseek-official', model: 'deepseek-official',
+    })
+
+    await expect(server.handleRequest('session/resume', { sessionId: 'resumed' })).resolves.toEqual({
+      sessionId: 'resumed',
+      durablePrefixCount: 17,
+      nextSeq: 18,
+    })
+    expect(resume).toHaveBeenCalledWith({
+      resumeSessionId: SessionId('resumed'),
+      agentOptions: { provider: 'deepseek-official', model: 'deepseek-official' },
+    })
+    expect(create).not.toHaveBeenCalled()
+    await expect(server.handleRequest('session/resume', { sessionId: 'resumed' }))
+      .rejects.toThrow(/already open/)
+    await server.shutdown()
+    expect(handle.dispose).toHaveBeenCalledOnce()
+  })
+
+  it('requires exactly one initialize and rejects resume after prompt-created ownership', async () => {
+    const followup = vi.fn<Agent['followup']>()
+    const session = { id: SessionId('created'), header: { cwd: process.cwd() } }
+    const agent = ({ id: session.id, session, followup }) as unknown as Agent
+    const handle = { agent, dispose: vi.fn(() => Promise.resolve()) }
+    const create = vi.fn(async () => handle)
+    const resume = vi.fn()
+    const ctx = {
+      on: vi.fn(() => () => undefined),
+      agents: {
+        create,
+        resume,
+        get: (id: SessionId) => String(id) === 'created' ? agent : undefined,
+      },
+      get: () => ({ listProviders: () => [{ id: 'deepseek-official', name: 'DeepSeek' }] }),
+    } as unknown as Context
+    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
+
+    await expect(server.handleRequest('session/prompt', {
+      sessionId: 'created', contentBlocks: [{ type: 'text', text: 'before initialize' }],
+    })).rejects.toThrow('SDK server is not initialized')
+    await expect(server.handleRequest('session/resume', { sessionId: 'created' }))
+      .rejects.toThrow('SDK server is not initialized')
+
+    const initialize = { cwd: process.cwd(), provider: 'deepseek-official', model: 'fixed-route' }
+    await expect(server.initialize(initialize)).resolves.toMatchObject({
+      serverInfo: { name: 'deepseek-harness-sdk-runtime' },
+    })
+    await expect(server.initialize({ ...initialize, model: 'forbidden-route-change' }))
+      .rejects.toThrow('SDK server is already initialized')
+    const promptResult = await server.prompt({
+      sessionId: 'created', contentBlocks: [{ type: 'text', text: 'create once' }],
+    })
+    expect(promptResult.messageId).toBeTypeOf('string')
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({
+      agentOptions: { provider: 'deepseek-official', model: 'fixed-route' },
+    }))
+    await expect(server.resume({ sessionId: 'created' })).rejects.toThrow('already open')
+    expect(resume).not.toHaveBeenCalled()
+
+    await server.shutdown()
+    expect(handle.dispose).toHaveBeenCalledOnce()
+  })
+
+  it('waits for an in-flight initialize before shutdown disposes its adapter', async () => {
+    const mounted = Promise.withResolvers<{ dispose(): Promise<void> }>()
+    const dispose = vi.fn(() => Promise.resolve())
+    const ctx = {
+      on: vi.fn(() => () => undefined),
+      agents: { create: vi.fn(), get: () => undefined },
+      get: () => ({ listProviders: () => [] }),
+      plugin: vi.fn(() => mounted.promise),
+    } as unknown as Context
+    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
+
+    const initialize = server.initialize({
+      cwd: process.cwd(), provider: 'deepseek-official', model: 'delayed-adapter',
+    })
+    let shutdownSettled = false
+    const shutdown = server.shutdown().finally(() => { shutdownSettled = true })
+    await Promise.resolve()
+
+    expect(shutdownSettled).toBe(false)
+    expect(dispose).not.toHaveBeenCalled()
+    mounted.resolve({ dispose })
+    await expect(initialize).resolves.toMatchObject({
+      serverInfo: { name: 'deepseek-harness-sdk-runtime' },
+    })
+    await expect(shutdown).resolves.toEqual({})
+    expect(dispose).toHaveBeenCalledOnce()
+    await expect(server.initialize({
+      cwd: process.cwd(), provider: 'deepseek-official', model: 'after-shutdown',
+    })).rejects.toThrow('SDK server is already initialized')
+  })
+
+  it('allows a failed initialize to retry without weakening the concurrent gate', async () => {
+    const mounted = Promise.withResolvers<{ dispose(): Promise<void> }>()
+    const dispose = vi.fn(() => Promise.resolve())
+    const plugin = vi.fn()
+      .mockRejectedValueOnce(new Error('adapter mount failed'))
+      .mockReturnValueOnce(mounted.promise)
+    const ctx = {
+      on: vi.fn(() => () => undefined),
+      agents: { create: vi.fn(), get: () => undefined },
+      get: () => ({ listProviders: () => [] }),
+      plugin,
+    } as unknown as Context
+    const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
+    const params = { cwd: process.cwd(), provider: 'deepseek-official', model: 'retry-adapter' }
+
+    await expect(server.initialize(params)).rejects.toThrow('adapter mount failed')
+    const retry = server.initialize(params)
+    await expect(server.initialize(params)).rejects.toThrow('SDK server is already initialized')
+    mounted.resolve({ dispose })
+    await expect(retry).resolves.toMatchObject({
+      serverInfo: { name: 'deepseek-harness-sdk-runtime' },
+    })
+    expect(plugin).toHaveBeenCalledTimes(2)
+    await server.shutdown()
+    expect(dispose).toHaveBeenCalledOnce()
+  })
+
   it('creates a harness agent and calls the configured OpenAI-compatible endpoint', { timeout: 15_000 }, async () => {
     const storageDir = await mkdtemp(join(tmpdir(), 'dsh-jsonrpc-'))
     const llmServer = await mockCompletionServer()
@@ -190,9 +329,12 @@ describe('HarnessSdkJsonRpcServer', () => {
     const ctx = {
       on: vi.fn(() => () => undefined),
       agents: { create, get: (id: SessionId) => liveAgents.get(String(id)) },
-      get: () => undefined,
+      get: () => ({ listProviders: () => [{ id: 'deepseek-official', name: 'DeepSeek' }] }),
     } as unknown as Context
     const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
+    await server.initialize({
+      cwd: process.cwd(), provider: 'deepseek-official', model: 'deepseek-official',
+    })
     const prompt = (sessionId: string, text: string) => server.prompt({
       sessionId,
       contentBlocks: [{ type: 'text', text }],
@@ -226,9 +368,12 @@ describe('HarnessSdkJsonRpcServer', () => {
         create: vi.fn(async () => handle),
         get: (id: SessionId) => (live && String(id) === 'zombie' ? agent : undefined),
       },
-      get: () => undefined,
+      get: () => ({ listProviders: () => [{ id: 'deepseek-official', name: 'DeepSeek' }] }),
     } as unknown as Context
     const server = new HarnessSdkJsonRpcServer(ctx, new FakeTransport())
+    await server.initialize({
+      cwd: process.cwd(), provider: 'deepseek-official', model: 'deepseek-official',
+    })
     const prompt = (text: string) => server.prompt({
       sessionId: 'zombie',
       contentBlocks: [{ type: 'text', text }],
