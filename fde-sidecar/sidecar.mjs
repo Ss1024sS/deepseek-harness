@@ -105,7 +105,8 @@ const ERROR_CODES = new Set([
   'FRAME_LIMIT_EXCEEDED', 'OUTPUT_LIMIT_EXCEEDED', 'STDERR_LIMIT_EXCEEDED',
   'PROTOCOL_VIOLATION', 'UNKNOWN_NOTIFICATION', 'UNKNOWN_EVENT', 'TOOLS_EXPOSED',
   'AMBIGUOUS_RESULT', 'INVALID_MODEL_OUTPUT', 'PERSISTENCE_NOT_PROVEN',
-  'CONTINUATION_STALE', 'SESSION_BUSY', 'RAW_REASONING_EXPOSED', 'CLEANUP_FAILED', 'SIDECAR_FAILURE',
+  'CONTINUATION_STALE', 'SESSION_BUSY', 'REPLAY_INPUT_UNSUPPORTED',
+  'RAW_REASONING_EXPOSED', 'CLEANUP_FAILED', 'SIDECAR_FAILURE',
 ])
 
 export class SidecarError extends Error {
@@ -285,7 +286,17 @@ export function validateRequest(value) {
   const payload = validatePayload(wrapper.payload)
   const payloadCanonical = canonicalJson(payload)
   if (sha256(payloadCanonical) !== wrapper.outgoingDigest) throw new SidecarError('DIGEST_MISMATCH')
-  return { outgoingDigest: wrapper.outgoingDigest, payloadCanonical, payloadSchemaVersion: payload.schemaVersion }
+  return {
+    outgoingDigest: wrapper.outgoingDigest,
+    payloadCanonical,
+    payloadSchemaVersion: payload.schemaVersion,
+    capabilityGaps: payload.facts.counts.capabilityGaps,
+  }
+}
+
+function enforceReplayInputBoundary(sessionMode, capabilityGaps) {
+  const allowed = sessionMode === 'start' ? [2, 12] : [0, 2, 12]
+  if (!allowed.includes(capabilityGaps)) throw new SidecarError('REPLAY_INPUT_UNSUPPORTED')
 }
 
 function safeText(value, maxCharacters) {
@@ -850,10 +861,13 @@ export class FdeHarnessSidecar {
   async analyze(rawRequest) {
     if (process.platform !== 'darwin') throw new SidecarError('PLATFORM_UNSUPPORTED')
     await proveSandboxActive()
-    const { outgoingDigest, payloadCanonical, payloadSchemaVersion } = validateRequest(rawRequest)
+    const {
+      outgoingDigest, payloadCanonical, payloadSchemaVersion, capabilityGaps,
+    } = validateRequest(rawRequest)
     if (this.sessionMode === 'resume' && payloadSchemaVersion !== 2) {
       throw new SidecarError('INVALID_REQUEST')
     }
+    enforceReplayInputBoundary(this.sessionMode, capabilityGaps)
     const verified = await verifyRuntimeManifest({ manifestPath: this.manifestPath })
     if (!/^sha256:[0-9a-f]{64}$/.test(this.effectiveProfileDigest ?? '')) {
       throw new SidecarError('SANDBOX_FAILURE')

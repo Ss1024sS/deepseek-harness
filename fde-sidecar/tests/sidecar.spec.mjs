@@ -73,6 +73,7 @@ async function v2Fixture() {
       countBucket: index < 2 ? 'ZERO' : index < 4 ? 'ONE' : index < 7 ? 'TWO_TO_FIVE' : 'SIX_PLUS',
     })),
   }
+  input.payload.facts.counts.capabilityGaps = 12
   input.outgoingDigest = payloadDigest(input.payload)
   return input
 }
@@ -335,6 +336,68 @@ describe('hardened FDE one-shot Harness sidecar', () => {
     expect(log).not.toContain('"redactedText":')
   })
 
+  it('rejects unsupported start capability-gap values before creating a durable Session', async () => {
+    for (const capabilityGaps of [20, 120]) {
+      const parent = await tempRoot(`unsupported-capability-gaps-${capabilityGaps}`)
+      const sessionRoot = join(parent, 'session-leaf')
+      const input = structuredClone(await v2Fixture())
+      input.payload.facts.counts.capabilityGaps = capabilityGaps
+      input.outgoingDigest = payloadDigest(input.payload)
+
+      const execution = await execa(process.execPath, [
+        join(sidecarRoot, 'sidecar.mjs'), '--start-session-root', sessionRoot,
+      ], { input: `${JSON.stringify(input)}\n`, reject: false, timeout: 5_000 })
+      expect(execution).toMatchObject({ exitCode: 2, stderr: '' })
+      const result = JSON.parse(execution.stdout)
+      expect(result).toEqual({
+        schemaVersion: 1,
+        kind: 'effiengine.fde-harness-sidecar-error',
+        error: { code: 'REPLAY_INPUT_UNSUPPORTED' },
+      })
+      expect(await readdir(sessionRoot, { recursive: true })).toEqual([])
+      const parentEntries = await readdir(parent, { recursive: true })
+      expect(parentEntries.some(path => path.endsWith('session.jsonl'))).toBe(false)
+      expect(parentEntries.some(path => path.endsWith('runtime-tmp') || path.endsWith('bootstrap'))).toBe(false)
+    }
+  })
+
+  it('rejects unsupported resume capability-gap values without changing the durable Session', async () => {
+    const parent = await tempRoot('unsupported-resume-capability-gaps')
+    const sessionRoot = join(parent, 'session-leaf')
+    const firstInput = await v2Fixture()
+    const firstExecution = await execa(process.execPath, [
+      join(sidecarRoot, 'sidecar.mjs'), '--start-session-root', sessionRoot,
+    ], { input: `${JSON.stringify(firstInput)}\n`, timeout: 5_000 })
+    const firstReceipt = JSON.parse(firstExecution.stdout)
+    const sessionFiles = (await readdir(sessionRoot, { recursive: true }))
+      .filter(path => path.endsWith('session.jsonl'))
+    expect(sessionFiles).toHaveLength(1)
+    const logPath = join(sessionRoot, sessionFiles[0])
+    const before = await readFile(logPath)
+    const resumeArgs = [
+      join(sidecarRoot, 'sidecar.mjs'), '--resume-session-root', sessionRoot,
+      '--expected-event-count', String(firstReceipt.evidence.eventCount),
+      '--expected-event-digest', firstReceipt.evidence.eventDigest,
+      '--expected-session-identity-digest', firstReceipt.evidence.sessionIdentityDigest,
+    ]
+
+    for (const capabilityGaps of [20, 120]) {
+      const input = structuredClone(await v2Fixture())
+      input.payload.facts.counts.capabilityGaps = capabilityGaps
+      input.outgoingDigest = payloadDigest(input.payload)
+      const execution = await execa(process.execPath, resumeArgs, {
+        input: `${JSON.stringify(input)}\n`, reject: false, timeout: 5_000,
+      })
+      expect(execution).toMatchObject({ exitCode: 2, stderr: '' })
+      expect(JSON.parse(execution.stdout)).toEqual({
+        schemaVersion: 1,
+        kind: 'effiengine.fde-harness-sidecar-error',
+        error: { code: 'REPLAY_INPUT_UNSUPPORTED' },
+      })
+      expect(await readFile(logPath)).toEqual(before)
+    }
+  })
+
   it('serializes real cross-process resumes and preserves a restart-safe visible capsule', async () => {
     const parent = await tempRoot('p2-l2b-resume')
     const sessionRoot = join(parent, 'session-leaf')
@@ -407,11 +470,13 @@ describe('hardened FDE one-shot Harness sidecar', () => {
     })
     expect(secondReceipt.evidence.lastEventSeq).toBe(secondReceipt.evidence.eventCount - 1)
     expect(secondReceipt.evidence.sessionIdentityDigest).toBe(firstReceipt.evidence.sessionIdentityDigest)
-    expect(secondReceipt.outcome.suggestion.summary).toContain('历史能力缺口=2')
+    expect(firstInput.payload.facts.counts.capabilityGaps).toBe(12)
+    expect(secondInput.payload.facts.counts.capabilityGaps).toBe(0)
+    expect(secondReceipt.outcome.suggestion.summary).toBe('历史能力缺口=12')
     await expect(lstat(lockPath)).rejects.toMatchObject({ code: 'ENOENT' })
 
     const thirdInput = structuredClone(await v2Fixture())
-    thirdInput.payload.facts.counts.capabilityGaps = 1
+    thirdInput.payload.facts.counts.capabilityGaps = 0
     thirdInput.outgoingDigest = payloadDigest(thirdInput.payload)
     const thirdExecution = await execa(process.execPath, [
       join(sidecarRoot, 'sidecar.mjs'), '--resume-session-root', sessionRoot,
@@ -430,6 +495,7 @@ describe('hardened FDE one-shot Harness sidecar', () => {
       rawReasoningPersisted: false,
       toolCallCount: 0,
     })
+    expect(thirdReceipt.outcome.suggestion.summary).toBe('历史能力缺口=12')
 
     const finalRows = (await readFile(logPath, 'utf8')).trimEnd().split('\n').map(line => JSON.parse(line))
     const finalEvents = finalRows.slice(1)
@@ -444,6 +510,13 @@ describe('hardened FDE one-shot Harness sidecar', () => {
       .toEqual([
         canonicalJson(firstInput.payload), canonicalJson(secondInput.payload), canonicalJson(thirdInput.payload),
       ])
+    const durableAdvice = finalEvents.filter(event => event.type === 'assistant/message').map(event => {
+      const content = event.data.message.content
+      return parseAdvice(content.map(block => block.text).join(''))
+    })
+    expect(durableAdvice.map(advice => advice.summary)).toEqual([
+      '历史能力缺口=12', '历史能力缺口=12', '历史能力缺口=12',
+    ])
     const sessionEntries = await readdir(sessionRoot, { recursive: true, withFileTypes: true })
     expect(sessionEntries.filter(entry => entry.isFile()).map(entry => entry.name)).toEqual(['session.jsonl'])
     expect(sessionEntries.filter(entry => !entry.isFile() && !entry.isDirectory())).toEqual([])
